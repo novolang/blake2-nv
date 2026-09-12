@@ -5,6 +5,12 @@ All notable changes to blake2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-12
+
+### Changed
+
+- The README is rewritten in plain technical-writer prose: what BLAKE2 is in RFC 7693's own words, which packages are built on it, how to choose an entry point, and what running on a microcontroller means. No signature changed.
+
 ## 0.0.1 — 2026-09-12
 
 The **interface**: every signature and every effect row, and no bodies.

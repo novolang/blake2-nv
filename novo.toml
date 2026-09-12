@@ -1,6 +1,6 @@
 [package]
 name        = "blake2-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "RFC 7693's BLAKE2b and BLAKE2s: the parameter block as a value, so every mode — plain, keyed, salted, personalised — is one initialiser over different parameters; the compression function as a @value state a device holds in its own frame; and the digest written into a caller's buffer at any length from 1 byte to the algorithm's own.  The primitive Argon2 and PASETO v4 are both defined over.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
