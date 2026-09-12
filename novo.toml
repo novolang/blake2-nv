@@ -1,0 +1,48 @@
+[package]
+name        = "blake2-nv"
+version     = "0.0.1"
+description = "RFC 7693's BLAKE2b and BLAKE2s: the parameter block as a value, so every mode — plain, keyed, salted, personalised — is one initialiser over different parameters; the compression function as a @value state a device holds in its own frame; and the digest written into a caller's buffer at any length from 1 byte to the algorithm's own.  The primitive Argon2 and PASETO v4 are both defined over.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  BLAKE2 is addition, XOR and rotation over sixteen words and
+# a permutation table: no entropy source, no clock, nothing that opens
+# a file.  The key, the salt, the personalisation and the digest length
+# all arrive as arguments, which is what lets the same code run in a
+# firmware image and in a password-hashing server.
+#
+# It carries `tests/embedded_probe.nv`, so the device claim is BUILT.
+# `blake2b`, `blake2s` and `b2param` are the three modules the claim
+# covers — the word algebra and the parameter block, with no `Bytes`
+# anywhere in them — and the README says which half of the package a
+# device gets.
+layer       = "core"
+
+category    = "crypto"
+
+tags        = ["blake2", "blake2b", "blake2s", "hash", "mac", "rfc-7693", "crypto", "embedded"]
+repository  = "https://github.com/novolang/blake2-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "The hash Argon2 and PASETO v4 are defined over"
+
+[dependencies]
+# None.  BLAKE2 is self-contained: its IV is SHA-512's and SHA-256's,
+# written out as constants here rather than reached for through
+# crypto-nv, because a dependency for twelve numbers would put a
+# package in a device's link graph for nothing.  The one function a
+# consumer might expect to find here and will not — a constant-time tag
+# comparison — is crypto-nv's `digest.ct_eq`, and the README says to
+# take it from there: one implementation of that loop on the grid is
+# the arrangement worth having.

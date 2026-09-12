@@ -1,0 +1,344 @@
+// b2bytes_tests.nv — the digests, against RFC 7693's own vectors and
+// the reference implementation's keyed known-answer tests, plus the
+// exact calls the two packages that asked for this row will make.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: blake2-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE VECTORS ARE THE STANDARD'S AND THE REFERENCE'S.  Appendix A of
+// RFC 7693 is BLAKE2b-512("abc"), Appendix B is BLAKE2s-256("abc"),
+// and the empty-input pair is the one every implementation prints
+// first.  The two keyed vectors are entry 0 of `blake2-kat.json` in
+// `BLAKE2/BLAKE2`, which is the file the reference implementation's
+// own suite reads: key 00 01 … 3f for BLAKE2b and 00 01 … 1f for
+// BLAKE2s, over an EMPTY message — the case that proves the key's
+// padded block is compressed even when there is nothing to hash.
+//
+// A HASH THAT IS SUBTLY WRONG IS INVISIBLE FROM THE OUTSIDE: it
+// returns the right number of bytes, it verifies against itself, and
+// it is simply not the function anybody else computes.  These vectors
+// are the only thing that can tell.
+
+use std.bytes
+use std.test
+use b2param
+use b2bytes
+
+// RFC 7693 Appendix A.
+const B2B_ABC: Str = "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923"
+
+// The empty input at BLAKE2b's full width.
+const B2B_EMPTY: Str = "786a02f742015903c6c6fd852552d272912f4740e15847618a86e217f71f5419d25e1031afee585313896444934eb04b903a685b1448b755d56f701afe9be2ce"
+
+// RFC 7693 Appendix B.
+const B2S_ABC: Str = "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982"
+
+// The empty input at BLAKE2s's full width.
+const B2S_EMPTY: Str = "69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9"
+
+// blake2-kat entry 0: BLAKE2b-512, key 00..3f, empty message.
+const B2B_KEYED_EMPTY: Str = "10ebb67700b1868efb4417987acf4690ae9d972fb7a590c2f02871799aaa4786b5e996e8f0f4eb981fc214b005f42d2ff4233499391653df7aefcbc13fc51568"
+
+// blake2-kat entry 0: BLAKE2s-256, key 00..1f, empty message.
+const B2S_KEYED_EMPTY: Str = "48a8997da407876b3d79c0d92325ad3b89cbb754d86ab71aee047ad345fd2c49"
+
+// The reference suite's BLAKE2b key: the bytes 0x00 through 0x3f.
+const B2B_KAT_KEY: Str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+
+// The reference suite's BLAKE2s key: the bytes 0x00 through 0x1f.
+const B2S_KAT_KEY: Str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+
+@test
+fn test_blake2b_512_of_abc_is_rfc_7693_appendix_a() [io]
+    test.case("the vector the specification prints")
+    match b2bytes.blake2b_into(bytes.from_str("abc"), bytes.zeros(64))
+        Ok(d)  => test.assert_eq(bytes.to_hex(d), B2B_ABC)
+        Err(_) => test.assert(false)
+
+    test.case("and the empty input")
+    match b2bytes.blake2b_into(bytes.zeros(0), bytes.zeros(64))
+        Ok(d)  => test.assert_eq(bytes.to_hex(d), B2B_EMPTY)
+        Err(_) => test.assert(false)
+
+@test
+fn test_blake2s_256_of_abc_is_rfc_7693_appendix_b() [io]
+    test.case("the vector the specification prints")
+    match b2bytes.blake2s_into(bytes.from_str("abc"), bytes.zeros(32))
+        Ok(d)  => test.assert_eq(bytes.to_hex(d), B2S_ABC)
+        Err(_) => test.assert(false)
+
+    test.case("and the empty input")
+    match b2bytes.blake2s_into(bytes.zeros(0), bytes.zeros(32))
+        Ok(d)  => test.assert_eq(bytes.to_hex(d), B2S_EMPTY)
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_keyed_vectors_prove_the_key_block_is_compressed() [io]
+    test.case("BLAKE2b keyed with 00..3f over an EMPTY message")
+    // If the key's zero-padded block were skipped, this would be the
+    // unkeyed empty digest and the assertion would say so.
+    match bytes.from_hex(B2B_KAT_KEY)
+        Some(k) =>
+            match b2bytes.blake2b_keyed_into(k, bytes.zeros(0), bytes.zeros(64))
+                Ok(d)  => test.assert_eq(bytes.to_hex(d), B2B_KEYED_EMPTY)
+                Err(_) => test.assert(false)
+        None    => test.assert(false)
+
+    test.case("BLAKE2s keyed with 00..1f over an EMPTY message")
+    match bytes.from_hex(B2S_KAT_KEY)
+        Some(k) =>
+            match b2bytes.blake2s_keyed_into(k, bytes.zeros(0), bytes.zeros(32))
+                Ok(d)  => test.assert_eq(bytes.to_hex(d), B2S_KEYED_EMPTY)
+                Err(_) => test.assert(false)
+        None    => test.assert(false)
+
+@test
+fn test_an_empty_key_is_the_unkeyed_hash() [io]
+    test.case("blake2b_keyed_into with no key is blake2b_into")
+    // The property that lets a caller with an optional key take one
+    // code path.
+    match b2bytes.blake2b_keyed_into(bytes.zeros(0), bytes.from_str("abc"), bytes.zeros(64))
+        Ok(d)  => test.assert_eq(bytes.to_hex(d), B2B_ABC)
+        Err(_) => test.assert(false)
+
+    test.case("and the same for BLAKE2s")
+    match b2bytes.blake2s_keyed_into(bytes.zeros(0), bytes.from_str("abc"), bytes.zeros(32))
+        Ok(d)  => test.assert_eq(bytes.to_hex(d), B2S_ABC)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_shorter_digest_is_a_different_hash_not_a_prefix() [io]
+    test.case("BLAKE2b-256 of `abc` does not start with BLAKE2b-512 of `abc`")
+    // The single most common port defect, asserted rather than
+    // described: the digest length is in the initial state, so the two
+    // values share no bytes at all.
+    match b2bytes.blake2b_into(bytes.from_str("abc"), bytes.zeros(32))
+        Ok(d)  =>
+            test.assert_eq(bytes.len(d), 32)
+            test.assert(bytes.to_hex(d) != bytes.to_hex(bytes.slice(bytes.zeros(64), 0, 32)))
+            test.assert(not str_starts_with(B2B_ABC, bytes.to_hex(d)))
+        Err(_) => test.assert(false)
+
+// Whether `hay` begins with `needle`, over the hex spellings — a local
+// helper so the assertion above reads as the claim it is making.
+fn str_starts_with(hay: Str, needle: Str) -> Bool
+    match bytes.from_hex(needle)
+        Some(n) =>
+            match bytes.from_hex(hay)
+                Some(h) =>
+                    if bytes.len(n) > bytes.len(h)
+                        false
+                    else
+                        bytes.to_hex(bytes.slice(h, 0, bytes.len(n))) == bytes.to_hex(n)
+                None    => false
+        None    => false
+
+@test
+fn test_chunking_is_invisible() [io]
+    test.case("a, then bc, is abc at every boundary the buffer cares about")
+    let p = b2param.sequential(64)
+    var st = b2bytes.update_b(blake2b_init(p), bytes.from_str("a"))
+    st = b2bytes.update_b(st, bytes.from_str("bc"))
+    match b2bytes.finish_into_b(st, bytes.zeros(64))
+        Ok(d)  => test.assert_eq(bytes.to_hex(d), B2B_ABC)
+        Err(_) => test.assert(false)
+
+    test.case("and a range of a bigger buffer hashes the same as the slice")
+    var r = b2bytes.update_range_b(blake2b_init(p), bytes.from_str("xxabcxx"), 2, 3)
+    match b2bytes.finish_into_b(r, bytes.zeros(64))
+        Ok(d)  => test.assert_eq(bytes.to_hex(d), B2B_ABC)
+        Err(_) => test.assert(false)
+
+    test.case("BLAKE2s chunks the same way at its 64-byte block")
+    var s = b2bytes.update_s(blake2s_init(b2param.sequential(32)), bytes.from_str("a"))
+    s = b2bytes.update_range_s(s, bytes.from_str("bc"), 0, 2)
+    match b2bytes.finish_into_s(s, bytes.zeros(32))
+        Ok(d)  => test.assert_eq(bytes.to_hex(d), B2S_ABC)
+        Err(_) => test.assert(false)
+
+// The two initialisers, wrapped so the chunking test reads without a
+// second import in every line.
+fn blake2b_init(p: B2Params) -> B2bState
+    b2bytes.init_keyed_b(p, bytes.zeros(0))
+
+fn blake2s_init(p: B2Params) -> B2sState
+    b2bytes.init_keyed_s(p, bytes.zeros(0))
+
+@test
+fn test_the_width_checks_answer_before_a_value_is_built() [io]
+    test.case("a digest length outside the range is refused")
+    match b2bytes.check_digest_length_b(0)
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+    match b2bytes.check_digest_length_b(64)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+    match b2bytes.check_digest_length_s(33)
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+
+    test.case("an over-long key is refused and an empty one is not")
+    match b2bytes.check_key_b(bytes.zeros(65))
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+    match b2bytes.check_key_b(bytes.zeros(0))
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+    match b2bytes.check_key_s(bytes.zeros(33))
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+
+    test.case("a salt is EXACTLY the algorithm's width, or empty")
+    match b2bytes.check_salt_b(bytes.zeros(8))
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+    match b2bytes.check_salt_b(bytes.zeros(16))
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+    match b2bytes.check_salt_b(bytes.zeros(0))
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+    match b2bytes.check_salt_s(bytes.zeros(16))
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+
+    test.case("and so is a personalisation")
+    match b2bytes.check_personal_b(bytes.zeros(8))
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+    match b2bytes.check_personal_s(bytes.zeros(8))
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("the combined checks answer the first problem")
+    match b2bytes.check_inputs_b(32, bytes.zeros(0), bytes.zeros(0), bytes.zeros(0))
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+    match b2bytes.check_inputs_b(65, bytes.zeros(0), bytes.zeros(0), bytes.zeros(0))
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+    match b2bytes.check_inputs_s(32, bytes.zeros(33), bytes.zeros(0), bytes.zeros(0))
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+
+@test
+fn test_a_parameter_block_from_bytes_reads_the_widths_the_algorithm_uses() [io]
+    test.case("params_b puts sixteen bytes of salt into two words")
+    match bytes.from_hex("0102030405060708090a0b0c0d0e0f10")
+        Some(s) =>
+            let p = b2bytes.params_b(32, bytes.zeros(0), s, bytes.zeros(0))
+            test.assert_eq(b2param.salt_lo(p), b2bytes.word_le(s, 0))
+            test.assert_eq(b2param.salt_hi(p), b2bytes.word_le(s, 8))
+        None    => test.assert(false)
+
+    test.case("params_s puts eight bytes into the low word and leaves the high one zero")
+    match bytes.from_hex("0102030405060708")
+        Some(s) =>
+            let p = b2bytes.params_s(32, bytes.zeros(0), s, bytes.zeros(0))
+            test.assert_eq(b2param.salt_lo(p), b2bytes.word_le(s, 0))
+            test.assert_eq(b2param.salt_hi(p), 0)
+        None    => test.assert(false)
+
+    test.case("the little-endian readers are what both use")
+    match bytes.from_hex("0102030405060708")
+        Some(s) =>
+            test.assert_eq(b2bytes.word_le(s, 0), 0x0807060504030201)
+            test.assert_eq(b2bytes.word_le32(s, 0), 0x04030201)
+            test.assert_eq(b2bytes.word_le32(s, 4), 0x08070605)
+        None    => test.assert(false)
+
+@test
+fn test_the_full_one_shots_take_a_caller_built_block() [io]
+    test.case("a personalised BLAKE2b is a different hash from a plain one")
+    let plain = b2param.sequential(32)
+    let personal = b2param.with_personal(plain, 7, 0)
+    match b2bytes.blake2b_full_into(personal, bytes.zeros(0), bytes.from_str("abc"), bytes.zeros(32))
+        Ok(d)  =>
+            match b2bytes.blake2b_full_into(plain, bytes.zeros(0), bytes.from_str("abc"), bytes.zeros(32))
+                Ok(e)  => test.assert(bytes.to_hex(d) != bytes.to_hex(e))
+                Err(_) => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("and so is a personalised BLAKE2s")
+    match b2bytes.blake2s_full_into(b2param.with_personal(plain, 7, 0), bytes.zeros(0),
+                                    bytes.from_str("abc"), bytes.zeros(32))
+        Ok(d)  =>
+            match b2bytes.blake2s_full_into(plain, bytes.zeros(0), bytes.from_str("abc"), bytes.zeros(32))
+                Ok(e)  => test.assert(bytes.to_hex(d) != bytes.to_hex(e))
+                Err(_) => test.assert(false)
+        Err(_) => test.assert(false)
+
+    test.case("a tree block is refused rather than hashed as one leaf")
+    let tree = b2param.with_tree(b2param.sequential(32), 4, 2, 4096, 0, 0, 32)
+    match b2bytes.blake2b_full_into(tree, bytes.zeros(0), bytes.from_str("abc"), bytes.zeros(32))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and so is a block whose digest length disagrees with the buffer")
+    match b2bytes.blake2b_full_into(b2param.sequential(64), bytes.zeros(0),
+                                    bytes.from_str("abc"), bytes.zeros(32))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_calls_argon2_nv_will_make() [io]
+    test.case("RFC 9106 section 3.2's initial hash H is BLAKE2b at 64 bytes")
+    // argon2-nv's README names BLAKE2b as the primitive its whole
+    // surface is defined over.  H is the unkeyed 64-byte digest of the
+    // concatenated parameters; the secret K goes in as DATA, not as a
+    // BLAKE2b key, so argon2-nv needs no keyed call at all.
+    match b2bytes.blake2b_into(bytes.zeros(40), bytes.zeros(64))
+        Ok(d)  => test.assert_eq(bytes.len(d), 64)
+        Err(_) => test.assert(false)
+
+    test.case("and H-prime below 64 bytes is the same call at another length")
+    match b2bytes.blake2b_into(bytes.zeros(36), bytes.zeros(32))
+        Ok(d)  => test.assert_eq(bytes.len(d), 32)
+        Err(_) => test.assert(false)
+
+    test.case("H-prime above 64 chains 64-byte digests, taking 32 bytes of each")
+    // The chain is argon2-nv's; what it needs from here is that a
+    // 64-byte digest can be fed back in as a message, which is the
+    // streaming surface.
+    match b2bytes.blake2b_into(bytes.zeros(64), bytes.zeros(64))
+        Ok(d)  =>
+            match b2bytes.blake2b_into(d, bytes.zeros(64))
+                Ok(e)  => test.assert(bytes.to_hex(d) != bytes.to_hex(e))
+                Err(_) => test.assert(false)
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_calls_paseto_nv_will_make() [io]
+    test.case("v4.local key splitting: keyed BLAKE2b at 56 bytes")
+    // paseto-nv's `pasetoken` names these three exactly:
+    //   tmp = BLAKE2b(key, "paseto-encryption-key" || n, 56)
+    //   Ak  = BLAKE2b(key, "paseto-auth-key-for-aead" || n, 32)
+    //   t   = BLAKE2b(Ak, PAE([...]), 32)
+    // All three are `blake2b_keyed_into`, at three output lengths.
+    let key = bytes.zeros(32)
+    match b2bytes.blake2b_keyed_into(key, bytes.from_str("paseto-encryption-key"), bytes.zeros(56))
+        Ok(d)  => test.assert_eq(bytes.len(d), 56)
+        Err(_) => test.assert(false)
+
+    test.case("the auth subkey and the tag are the same call at 32 bytes")
+    match b2bytes.blake2b_keyed_into(key, bytes.from_str("paseto-auth-key-for-aead"), bytes.zeros(32))
+        Ok(d)  => test.assert_eq(bytes.len(d), 32)
+        Err(_) => test.assert(false)
+
+    test.case("a PASERK identifier is an UNKEYED digest at 33 bytes")
+    // Thirty-three, which is what makes an arbitrary digest length a
+    // requirement rather than a convenience: 33 is not a multiple of
+    // anything, and a package that only offered 32 and 64 could not
+    // compute a `k4.lid.` at all.
+    match b2bytes.blake2b_into(bytes.from_str("k4.local."), bytes.zeros(33))
+        Ok(d)  => test.assert_eq(bytes.len(d), 33)
+        Err(_) => test.assert(false)
+
+    test.case("the three lengths are three different hashes of the same input")
+    match b2bytes.blake2b_keyed_into(key, bytes.from_str("x"), bytes.zeros(32))
+        Ok(a)  =>
+            match b2bytes.blake2b_keyed_into(key, bytes.from_str("x"), bytes.zeros(56))
+                Ok(b)  => test.assert(bytes.to_hex(bytes.slice(b, 0, 32)) != bytes.to_hex(a))
+                Err(_) => test.assert(false)
+        Err(_) => test.assert(false)

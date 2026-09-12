@@ -1,0 +1,509 @@
+// blake2b.nv — BLAKE2b's state and its compression function, in word
+// algebra with no `Bytes` and no `Str` anywhere in the module.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THIS IS THE HALF THAT RUNS ON A DEVICE, and it is a WHOLE hash
+// rather than a fragment of one: `init`, `feed_byte`, `finish` and
+// `digest_byte` are a complete BLAKE2b with no allocator behind them.
+// A bootloader verifying an image in flash reads a byte, feeds it, and
+// compares sixteen bytes at the end; the arena is untouched and the
+// state is 224 bytes of its own stack frame.  The `Bytes` half is
+// `b2bytes`, one module up, and the split is crypto-nv's —
+// `sha512_core` beside `hashing`, for the same reason and with the
+// same shape.
+//
+// WORDS ARE `Int`, AND BLAKE2b'S ARE 64 BITS WIDE, which is this
+// language's whole `Int`.  Every bit pattern fits, so there is no mask
+// step the way BLAKE2s needs one; what there IS is wrapping, because
+// the algorithm is defined modulo 2^64 and `Int` traps on overflow
+// (SPEC § 13.2).  Every addition below is `int.wrapping_add` and every
+// value this module answers is the reference implementation's bit
+// pattern reinterpreted as signed — `b2bytes` is where it becomes
+// bytes again, and a caller printing one wants an unsigned rendering.
+//
+// THE BUFFER IS INSIDE THE STATE, as sixteen words, and that is the
+// decision the device claim rests on.  A hasher that kept its partial
+// block in a `Bytes` would be a heap object, could not be a `@value`,
+// and could not be held by a firmware at all.  Sixteen inline words is
+// 128 bytes of the caller's frame and the same 128 bytes the algorithm
+// compresses.
+//
+// BLAKE2 BUFFERS LAZILY, and a port that does not is wrong on exactly
+// one input in 128.  The last block is compressed with the
+// finalisation flag set, so the implementation may never compress a
+// full buffer just because it is full — it has to wait until another
+// byte arrives and prove the block was not the last.  `feed_byte` is
+// that rule: it compresses the block it is HOLDING before it stores
+// the byte it was HANDED, never after.
+//
+// WHAT IS CONSTANT TIME HERE, in one sentence each, because a crypto
+// package that does not say is a crypto package a reviewer cannot use:
+//
+//   * `g`, `round` and `compress` are constant time by construction —
+//     addition, XOR and rotation by a CONSTANT amount, no branch on a
+//     key bit, no table lookup indexed by data.  `sigma` is indexed by
+//     the round number and the lane, both of which are loop counters.
+//   * `feed_byte` branches on `buffered`, which is a message LENGTH.
+//     Message lengths are not secret in any construction this package
+//     is used by, and both of them — Argon2's H and PASETO's MAC — fix
+//     the length in advance.
+//   * `state_word`, `block_word`, `block_byte` and `digest_byte` index
+//     an inline array with an index the CALLER chose.  They are
+//     constant time with respect to the key; they are not constant
+//     time with respect to `i`, and nothing here passes a secret as
+//     `i`.
+//   * Nothing in this module compares anything.  A MAC comparison is
+//     crypto-nv's `digest.ct_eq`, and the README says to take it from
+//     there rather than writing a second one.
+
+use b2param
+
+// ── Sizes ────────────────────────────────────────────────────────────
+
+// The chaining value, in 64-bit words: eight, which is 512 bits.
+pub const B2B_STATE_WORDS = 8
+
+// The message block, in 64-bit words: sixteen.
+pub const B2B_BLOCK_WORDS = 16
+
+// The message block, in bytes: one hundred and twenty-eight.
+pub const B2B_BLOCK_BYTES = 128
+
+// The working vector the compression function mixes, in words:
+// sixteen — the eight chaining words and the eight IV words.
+pub const B2B_WORK_WORDS = 16
+
+// The rounds: twelve.  RFC 7693 § 2.5 fixes it, and a package that
+// offered fewer would be offering a caller a choice they have no way
+// to make.
+pub const B2B_ROUNDS = 12
+
+// The digest, at its longest: 64 bytes.  The same number as
+// `b2param.B2B_OUT_BYTES_MOST`, repeated here so a caller sizing a
+// buffer at the state's own module does not have to reach for another.
+pub const B2B_DIGEST_BYTES_MOST = 64
+
+// ── The two values ───────────────────────────────────────────────────
+
+// A BLAKE2b hash in flight: the chaining value, the block being
+// filled, the byte counter, the two finalisation flags, and the digest
+// length the parameter block asked for.
+//
+// A `@value` struct, so all of it lives in the caller's frame — no
+// cell, no header, no reference count — and `[Int; 8]` and `[Int; 16]`
+// inside one are true inline arrays (SPEC § 14.4).  Two hundred and
+// twenty-four bytes of stack is what a device spends to hold a BLAKE2b
+// in flight, and there is nothing else to spend.
+//
+// ```novo
+// use blake2b
+// use b2param
+//
+// fn main() [io]
+//     let st = blake2b.init(b2param.sequential(32))
+//     println("${blake2b.digest_length(st)}")              // 32
+// ```
+pub @value
+struct B2bState
+    // The chaining value h[0..7], as RFC 7693 § 2.6 names it.
+    h: [Int; 8]
+    // The message block being filled, as sixteen little-endian words:
+    // byte `j` of the block is bits `8*(j mod 8)` of word `j / 8`.
+    m: [Int; 16]
+    // The low half of the 128-bit byte counter `t`.
+    t0: Int
+    // The high half of the 128-bit byte counter `t`.  A message long
+    // enough to reach it does not exist, and the field is here because
+    // the parameter block's word 13 is XORed with it and a port that
+    // omitted it would be XORing garbage.
+    t1: Int
+    // The finalisation flag `f0`: all ones on the last block, zero
+    // before it.
+    f0: Int
+    // The last-node flag `f1`: all ones on the last node of a tree's
+    // last layer, zero in sequential mode.  Present because the
+    // parameter block can describe a tree even though this package's
+    // one-shots do not drive one.
+    f1: Int
+    // Bytes of `m` that hold message: 0 ..= 128.  Reaching 128 does
+    // NOT compress — see the lazy-buffering note above.
+    buffered: Int
+    // Bytes of digest this state will produce, copied out of the
+    // parameter block so `finish` and `digest_byte` need no second
+    // argument.
+    outlen: Int
+
+// The sixteen-word working vector one compression mixes.
+//
+// Its own type rather than a second `B2bState`, because the two are
+// the same shape and mean opposite things — one is a hash a caller may
+// still feed, the other is scratch that is dead the moment the
+// feed-forward has run — and a program that mixed them up would
+// produce a chaining value out of a half-mixed vector and never
+// notice.
+//
+// ```novo
+// use blake2b
+// use b2param
+//
+// fn main() [io]
+//     let w = blake2b.work(blake2b.init(b2param.sequential(64)))
+//     println("${blake2b.work_word(w, 12)}")
+// ```
+pub @value
+struct B2bWork
+    // v[0..15]: the chaining value, then the IV with `t` and `f`
+    // folded in.
+    v: [Int; 16]
+
+// ── The constants of the algorithm ───────────────────────────────────
+
+// IV word `i`, for `i` in 0 ..= 7: SHA-512's initial value, which is
+// the fractional parts of the square roots of the first eight primes.
+//
+// Public because it is what a reader checks first when a digest
+// disagrees, and because a caller writing their own tree initialiser
+// needs it.  Not taken from crypto-nv: eight numbers are not worth a
+// dependency in a device's link graph.
+//
+// FIVE OF THE EIGHT HAVE THE HIGH BIT SET, and `Int` is signed, so
+// they cannot be written as hex literals — 0xBB67AE8584CAA73B is
+// -4942790177534073029 spelled the way the source has to spell it.
+// crypto-nv's `sha512_core.new` writes the same five the same way.
+// The implementation keeps the hex in a comment beside each; the tests
+// compare against the decimals.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.iv(0) == 0x6a09e667f3bcc908}")     // true
+// ```
+pub fn iv(i: Int) -> Int []
+    todo("blake2-nv.blake2b.iv")
+
+// The message-word permutation: σ[r][i], for `r` in 0 ..= 11 and `i`
+// in 0 ..= 15 (RFC 7693 § 2.7).
+//
+// Twelve rounds over a table of ten rows: rounds 10 and 11 reuse rows
+// 0 and 1, which is the one line of the specification a port skips
+// most often and the reason BLAKE2b and BLAKE2s share a table.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.sigma(0, 0)}")                     // 0
+// ```
+pub fn sigma(r: Int, i: Int) -> Int []
+    todo("blake2-nv.blake2b.sigma")
+
+// Rotation amount `i`, for `i` in 0 ..= 3: 32, 24, 16, 63 (§ 2.1's
+// R1..R4).
+//
+// BLAKE2s's are 16, 12, 8, 7, and that difference is the whole of what
+// makes the two algorithms two algorithms rather than one at two
+// widths.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.rotation(3)}")                     // 63
+// ```
+pub fn rotation(i: Int) -> Int []
+    todo("blake2-nv.blake2b.rotation")
+
+// `x` rotated right by `n` bits, over 64.
+//
+// Public because it is the operation a reader disassembling a
+// disagreement wants to call directly, and because there is no
+// standard-library rotate that is 64-bit by definition rather than by
+// the platform.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.rotr(1, 1)}")
+// ```
+pub fn rotr(x: Int, n: Int) -> Int []
+    todo("blake2-nv.blake2b.rotr")
+
+// ── Building a state ─────────────────────────────────────────────────
+
+// A state with every word zero.
+//
+// Not a usable hash — `init` is — but the value a device builds a
+// state out of when it sets words itself, and the one the tests
+// compare a fresh state against.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.buffered(blake2b.zero_state())}")  // 0
+// ```
+pub fn zero_state() -> B2bState []
+    todo("blake2-nv.blake2b.zero_state")
+
+// The state RFC 7693 § 2.6 starts from: h[i] = IV[i] XOR the
+// parameter block's word `i`, the counter zero, both flags clear.
+//
+// THIS IS WHERE THE DIGEST LENGTH TAKES EFFECT, which is why
+// BLAKE2b-256 is not BLAKE2b-512 truncated: `digest_length` is byte 0
+// of `b2param.b_word(p, 0)` and is XORed into h[0] before a byte of
+// message is seen.
+//
+// It does NOT feed a key.  A keyed hash's first message block is the
+// zero-padded key, which needs a `Bytes` and so lives in
+// `b2bytes.init_keyed_b`; a device with the key in words calls this
+// and then fills the block itself.
+//
+// ```novo
+// use blake2b
+// use b2param
+//
+// fn main() [io]
+//     let st = blake2b.init(b2param.sequential(64))
+//     println("${blake2b.counter_low(st)}")                 // 0
+// ```
+pub fn init(p: B2Params) -> B2bState []
+    todo("blake2-nv.blake2b.init")
+
+// ── Reading and writing the state ────────────────────────────────────
+
+// Chaining word `i`, for `i` in 0 ..= 7.
+pub fn state_word(st: B2bState, i: Int) -> Int []
+    todo("blake2-nv.blake2b.state_word")
+
+// The same state with chaining word `i` set.
+//
+// For a caller resuming a hash from a checkpoint they stored, and for
+// a tree mode that keys a node from another node's output.
+pub fn with_state_word(st: B2bState, i: Int, v: Int) -> B2bState []
+    todo("blake2-nv.blake2b.with_state_word")
+
+// Message word `i` of the block being filled, for `i` in 0 ..= 15.
+pub fn block_word(st: B2bState, i: Int) -> Int []
+    todo("blake2-nv.blake2b.block_word")
+
+// The same state with message word `i` set.  Does not move
+// `buffered`: a caller filling the block by words sets it with
+// `with_buffered`.
+pub fn with_block_word(st: B2bState, i: Int, v: Int) -> B2bState []
+    todo("blake2-nv.blake2b.with_block_word")
+
+// Byte `j` of the block being filled, for `j` in 0 ..= 127, read out
+// of the little-endian word that holds it.
+pub fn block_byte(st: B2bState, j: Int) -> Int []
+    todo("blake2-nv.blake2b.block_byte")
+
+// The same state with byte `j` of the block set.  Does not move
+// `buffered`.
+pub fn with_block_byte(st: B2bState, j: Int, b: Int) -> B2bState []
+    todo("blake2-nv.blake2b.with_block_byte")
+
+// Bytes of the block that hold message: 0 ..= 128.
+pub fn buffered(st: B2bState) -> Int []
+    todo("blake2-nv.blake2b.buffered")
+
+// The same state with `buffered` set.
+pub fn with_buffered(st: B2bState, n: Int) -> B2bState []
+    todo("blake2-nv.blake2b.with_buffered")
+
+// The same state with every block byte from `buffered` to the end set
+// to zero.
+//
+// What `finish` does before the last compression, published because a
+// caller driving the compression themselves has to do it and because
+// forgetting it hashes whatever the previous block left behind — a
+// bug that produces a stable wrong answer and no symptom.
+pub fn zero_tail(st: B2bState) -> B2bState []
+    todo("blake2-nv.blake2b.zero_tail")
+
+// The low half of the byte counter.
+pub fn counter_low(st: B2bState) -> Int []
+    todo("blake2-nv.blake2b.counter_low")
+
+// The high half of the byte counter.
+pub fn counter_high(st: B2bState) -> Int []
+    todo("blake2-nv.blake2b.counter_high")
+
+// The same state with `n` added to the 128-bit byte counter, carrying
+// into the high half.
+pub fn add_counter(st: B2bState, n: Int) -> B2bState []
+    todo("blake2-nv.blake2b.add_counter")
+
+// The same state with the byte counter set outright.
+//
+// For a caller resuming a hash, and for reproducing a reference
+// implementation's intermediate state in a test.
+pub fn with_counter(st: B2bState, lo: Int, hi: Int) -> B2bState []
+    todo("blake2-nv.blake2b.with_counter")
+
+// The same state with the finalisation flag `f0` set to all ones.
+//
+// Applies to the LAST block only.  Setting it early ends the hash
+// early, and the digest is a legal BLAKE2b of a prefix, which is why
+// `finish` is the function to call rather than this one.
+pub fn mark_last(st: B2bState) -> B2bState []
+    todo("blake2-nv.blake2b.mark_last")
+
+// The same state with the last-node flag `f1` set to all ones.
+//
+// Tree mode's flag, for the last node of the last layer.  Sequential
+// hashing never sets it, and this package's one-shots never call this.
+pub fn mark_last_node(st: B2bState) -> B2bState []
+    todo("blake2-nv.blake2b.mark_last_node")
+
+// Whether `f0` is set.
+pub fn is_last(st: B2bState) -> Bool []
+    todo("blake2-nv.blake2b.is_last")
+
+// Whether `f1` is set.
+pub fn is_last_node(st: B2bState) -> Bool []
+    todo("blake2-nv.blake2b.is_last_node")
+
+// Bytes of digest this state will produce.
+pub fn digest_length(st: B2bState) -> Int []
+    todo("blake2-nv.blake2b.digest_length")
+
+// ── The compression function ─────────────────────────────────────────
+
+// The working vector at the start of a compression: v[0..7] = h,
+// v[8..15] = IV, with v[12] XOR t0, v[13] XOR t1, v[14] XOR f0 and
+// v[15] XOR f1 (RFC 7693 § 3.2).
+//
+// ```novo
+// use blake2b
+// use b2param
+//
+// fn main() [io]
+//     let w = blake2b.work(blake2b.init(b2param.sequential(64)))
+//     println("${blake2b.work_word(w, 8) == blake2b.iv(0)}")   // true
+// ```
+pub fn work(st: B2bState) -> B2bWork []
+    todo("blake2-nv.blake2b.work")
+
+// Working word `i`, for `i` in 0 ..= 15.
+pub fn work_word(w: B2bWork, i: Int) -> Int []
+    todo("blake2-nv.blake2b.work_word")
+
+// The same working vector with word `i` set.
+pub fn with_work_word(w: B2bWork, i: Int, v: Int) -> B2bWork []
+    todo("blake2-nv.blake2b.with_work_word")
+
+// The G mixing function at lanes `a`, `b`, `c`, `d` with message
+// words `x` and `y` (RFC 7693 § 3.1).
+//
+// Four indices and two message words rather than four words in and
+// four out, because a `@value` cannot be a tuple payload and because
+// this is the shape chacha20-nv's `quarter_round` settled on for the
+// same constraint.  The indices are loop counters, never data.
+//
+// ```novo
+// use blake2b
+// use b2param
+//
+// fn main() [io]
+//     let w = blake2b.work(blake2b.init(b2param.sequential(64)))
+//     println("${blake2b.work_word(blake2b.g(w, 0, 4, 8, 12, 0, 0), 0)}")
+// ```
+pub fn g(w: B2bWork, a: Int, b: Int, c: Int, d: Int, x: Int, y: Int) -> B2bWork []
+    todo("blake2-nv.blake2b.g")
+
+// One round: the four column mixes and the four diagonal mixes, with
+// the message words σ[r] selects out of the state's block.
+//
+// ```novo
+// use blake2b
+// use b2param
+//
+// fn main() [io]
+//     let st = blake2b.init(b2param.sequential(64))
+//     println("${blake2b.work_word(blake2b.round(blake2b.work(st), st, 0), 0)}")
+// ```
+pub fn round(w: B2bWork, st: B2bState, r: Int) -> B2bWork []
+    todo("blake2-nv.blake2b.round")
+
+// The compression function F: twelve rounds over the state's block,
+// then h[i] = h[i] XOR v[i] XOR v[i+8].
+//
+// Answers the state with the new chaining value and `buffered` back at
+// zero; the counter and the flags are the caller's to move, because
+// the order they move in is what separates a correct implementation
+// from one that is off by a block.
+//
+// ```novo
+// use blake2b
+// use b2param
+//
+// fn main() [io]
+//     let st = blake2b.compress(blake2b.init(b2param.sequential(64)))
+//     println("${blake2b.buffered(st)}")                    // 0
+// ```
+pub fn compress(st: B2bState) -> B2bState []
+    todo("blake2-nv.blake2b.compress")
+
+// ── The streaming hash, with no `Bytes` in it ────────────────────────
+
+// One more byte of message.
+//
+// The whole of BLAKE2b's update rule in one function, and the reason
+// the device claim is a hash rather than a fragment: if the block is
+// already full, the counter advances by 128 and THAT block is
+// compressed — proving it was not the last — and only then is the new
+// byte stored.
+//
+// A firmware hashing a flash image calls this in a loop and spends
+// nothing but its own frame.
+//
+// ```novo
+// use blake2b
+// use b2param
+//
+// fn main() [io]
+//     let st = blake2b.feed_byte(blake2b.init(b2param.sequential(32)), 0x61)
+//     println("${blake2b.buffered(st)}")                    // 1
+// ```
+pub fn feed_byte(st: B2bState, b: Int) -> B2bState []
+    todo("blake2-nv.blake2b.feed_byte")
+
+// The last compression: zero the tail of the block, advance the
+// counter by the bytes buffered, set `f0`, and compress.
+//
+// Answers the finished state, whose chaining value IS the digest —
+// read it with `digest_byte`.  Calling `feed_byte` afterwards produces
+// a value with no meaning, and the state says so through `is_last`.
+//
+// ```novo
+// use blake2b
+// use b2param
+//
+// fn main() [io]
+//     let st = blake2b.finish(blake2b.init(b2param.sequential(32)))
+//     println("${blake2b.is_last(st)}")                     // true
+// ```
+pub fn finish(st: B2bState) -> B2bState []
+    todo("blake2-nv.blake2b.finish")
+
+// Byte `i` of the digest, for `i` below `digest_length`, read
+// little-endian out of the chaining value.
+//
+// Little-endian, which is the half of the output a port gets wrong
+// while the arithmetic is right: BLAKE2b's state words are big
+// numbers and its digest is their bytes in the other order.
+//
+// ```novo
+// use blake2b
+// use b2param
+//
+// fn main() [io]
+//     let st = blake2b.finish(blake2b.init(b2param.sequential(32)))
+//     println("${blake2b.digest_byte(st, 0)}")
+// ```
+pub fn digest_byte(st: B2bState, i: Int) -> Int []
+    todo("blake2-nv.blake2b.digest_byte")

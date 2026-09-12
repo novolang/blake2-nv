@@ -1,0 +1,126 @@
+// b2err.nv — one error type for the whole package, and every arm is a
+// caller's mistake rather than a failure of the algorithm.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// BLAKE2 CANNOT FAIL.  The compression function is defined on every
+// input, there is no authentication step here, and nothing in RFC 7693
+// refuses anything.  So every variant below is a width a caller got
+// wrong — a digest length outside 1 ..= 64, a key longer than the
+// algorithm admits, a salt that is not exactly the algorithm's width,
+// an output buffer with no room.  A reader who sees one of these in a
+// log is reading about the program, not about the data.
+//
+// WHY THE WIDTH CHECKS ARE FUNCTIONS AND NOT REFUSING CONSTRUCTORS.
+// `B2Params` and the two states are `@value` structs, and an unboxed
+// struct may not be a `Result` payload (SPEC § 14.5), so a constructor
+// that wanted to refuse could not answer the refusal.  The shape that
+// works — and the shape chacha20-nv arrived at for the same reason —
+// is a `check_*` function that answers `?B2Error` BEFORE the value is
+// built, and a constructor that trusts what it is given.  A caller
+// that skips the check gets a well-defined hash of the wrong shape,
+// not memory corruption; `b2bytes` calls the check in every one-shot.
+
+// What a caller can get wrong.
+//
+// The variants are prefixed because a variant is constructed by NAME
+// across the whole assembly, so a bare `KeyTooLong` here would collide
+// with a `KeyTooLong` in any package a consumer also depends on.
+pub enum B2Error
+    // The digest length is outside the algorithm's range: 1 ..= 64 for
+    // BLAKE2b, 1 ..= 32 for BLAKE2s.  Carries what was asked and what
+    // the algorithm allows, because the second number is the one the
+    // caller needs and the one an error message usually omits.
+    //
+    // ZERO IS NOT A DEGENERATE CASE, IT IS REFUSED.  RFC 7693 § 2.8
+    // puts the digest length in the parameter block and therefore in
+    // the initial chaining value, so a zero-length digest names a
+    // state nothing else computes and produces no bytes to compare.
+    B2DigestLengthOutOfRange(got: Int, most: Int)
+
+    // The key is longer than the algorithm admits: 64 bytes for
+    // BLAKE2b, 32 for BLAKE2s.
+    //
+    // There is no minimum.  A zero-length key is the UNKEYED mode and
+    // is not an error — `keyed(n, 0)` and `sequential(n)` are the same
+    // parameter block, which is a property the tests pin.
+    B2KeyTooLong(got: Int, most: Int)
+
+    // The salt is not exactly the algorithm's width: 16 bytes for
+    // BLAKE2b, 8 for BLAKE2s, or empty for none.
+    //
+    // EXACTLY, not "at most".  The salt occupies fixed bytes of the
+    // parameter block, so a short salt is a salt followed by zeros,
+    // and a caller who passed eight bytes to BLAKE2b has silently
+    // agreed to a different value than the one they meant.
+    B2SaltWidthWrong(got: Int, want: Int)
+
+    // The personalisation is not exactly the algorithm's width: 16
+    // bytes for BLAKE2b, 8 for BLAKE2s, or empty for none.  Same rule
+    // as the salt.
+    B2PersonalWidthWrong(got: Int, want: Int)
+
+    // The caller's output buffer has less room than the digest length
+    // the state was initialised with.  Carries what is needed and what
+    // is there.
+    B2OutputTooSmall(want: Int, have: Int)
+
+    // A tree-hashing parameter was set on a state a sequential
+    // one-shot was asked to drive.  Carries the fanout and the depth
+    // that were asked for.
+    //
+    // `b2param` can BUILD a tree parameter block — it is the format,
+    // and a caller implementing BLAKE2bp or a Merkle mode needs it —
+    // but `b2bytes`'s sequential one-shots refuse one rather than
+    // hashing the first leaf and calling it the answer.  See the
+    // README's "What is outside, and named".
+    B2TreeModeNotDriven(fanout: Int, depth: Int)
+
+// What went wrong, in words, for a caller that logs rather than
+// branches.
+//
+// `Result<_, B2Error>` requires it: SPEC § 3.4 admits a `Result` error
+// type only if it implements `Error`, so this impl is what lets the
+// two fallible functions in the package name their own refusal instead
+// of returning `Result<_, Str>`.
+//
+// ```novo
+// use b2err
+//
+// fn main() [io]
+//     println(b2err.describe(B2KeyTooLong(80, 64)))
+// ```
+impl Error for B2Error
+    fn message(self) -> Str
+        todo("blake2-nv.b2err.B2Error.message")
+
+// The same sentence as `message`, as a free function, for a caller
+// that has an error value rather than a `Result` to call `.message()`
+// on.
+//
+// ```novo
+// use b2err
+//
+// fn main() [io]
+//     println(b2err.describe(B2OutputTooSmall(32, 16)))
+// ```
+pub fn describe(e: B2Error) -> Str []
+    todo("blake2-nv.b2err.describe")
+
+// Whether the fault is a width a caller chose, as opposed to a mode
+// this package declines to drive.
+//
+// True for every arm but `B2TreeModeNotDriven`.  The distinction is
+// worth a function because the two want different repairs: a width is
+// a bug in the call, and a tree mode is a feature this package scoped
+// out and a caller drives itself out of `b2param` and `blake2b`.
+//
+// ```novo
+// use b2err
+//
+// fn main() [io]
+//     println("${b2err.is_width_fault(B2OutputTooSmall(32, 16))}")   // true
+// ```
+pub fn is_width_fault(e: B2Error) -> Bool []
+    todo("blake2-nv.b2err.is_width_fault")

@@ -1,0 +1,398 @@
+// blake2s.nv — BLAKE2s's state and its compression function, in word
+// algebra with no `Bytes` and no `Str` anywhere in the module.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// BLAKE2s IS NOT BLAKE2b AT HALF THE WIDTH, and the differences are
+// exactly five.  A port that changes only the word size produces a
+// hash that passes no vector, so they are written here rather than
+// left to a reader to diff:
+//
+//   the word           32 bits, so every result is masked back to
+//                      0 ..= 2^32-1 — `Int` is 64 bits wide and a
+//                      sum or a rotation that is not masked silently
+//                      keeps the high half.
+//   the block          64 bytes, sixteen words.
+//   the rounds         TEN, not twelve.
+//   the rotations      16, 12, 8, 7 — not 32, 24, 16, 63.
+//   the counter        64 bits as two 32-bit halves, and the parameter
+//                      block puts `node_offset` in SIX bytes rather
+//                      than eight (`b2param.s_word` is where that
+//                      lives).
+//
+// The permutation table σ is the SAME as BLAKE2b's, and BLAKE2s uses
+// its first ten rows because it has ten rounds.  That is the one thing
+// the two algorithms genuinely share.
+//
+// WHO WANTS IT.  BLAKE2s is the 32-bit-machine member of the family —
+// a Cortex-M does its arithmetic in single registers where BLAKE2b
+// needs pairs — and it is what an embedded consumer reaches for.  It
+// is also what the WireGuard and Noise constructions specify.  Neither
+// of this package's two named consumers uses it: Argon2 and PASETO v4
+// are both BLAKE2b.  It is here because a `core` crypto package that
+// shipped half of RFC 7693 would send the next device consumer to a
+// second copy.
+//
+// THE DEVICE CLAIM COVERS THIS MODULE, and the whole hash is here:
+// `init`, `feed_byte`, `finish`, `digest_byte`.  The `Bytes` half is
+// `b2bytes`.
+//
+// WHAT IS CONSTANT TIME is what `blake2b` says, word for word: `g`,
+// `round` and `compress` are addition, XOR and constant rotation with
+// no data-dependent index; `feed_byte` branches on a message length;
+// the accessors are constant time with respect to the key and not with
+// respect to their index; and nothing here compares anything.
+
+use b2param
+
+// ── Sizes ────────────────────────────────────────────────────────────
+
+// The chaining value, in 32-bit words: eight, which is 256 bits.
+pub const B2S_STATE_WORDS = 8
+
+// The message block, in 32-bit words: sixteen.
+pub const B2S_BLOCK_WORDS = 16
+
+// The message block, in bytes: sixty-four.
+pub const B2S_BLOCK_BYTES = 64
+
+// The working vector, in words: sixteen.
+pub const B2S_WORK_WORDS = 16
+
+// The rounds: ten.
+pub const B2S_ROUNDS = 10
+
+// The digest, at its longest: 32 bytes.
+pub const B2S_DIGEST_BYTES_MOST = 32
+
+// The mask that keeps a word 32 bits wide: 2^32 - 1.
+//
+// Public because it is the operation this module has and `blake2b`
+// does not, and a reader comparing the two should be able to see where
+// it is applied rather than infer it.
+pub const B2S_WORD_MASK = 0xffffffff
+
+// ── The two values ───────────────────────────────────────────────────
+
+// A BLAKE2s hash in flight.
+//
+// The same eleven fields as `B2bState` at half the widths: eight
+// chaining words, sixteen block words, a two-word counter, two flags,
+// the bytes buffered and the digest length.  A `@value`, so a device
+// holds one hundred and sixty bytes of its own frame and nothing else.
+//
+// Every word field is masked to 32 bits; a state whose words are not
+// is a state some function forgot `B2S_WORD_MASK`, and the tests pin
+// that at the block function.
+//
+// ```novo
+// use blake2s
+// use b2param
+//
+// fn main() [io]
+//     let st = blake2s.init(b2param.sequential(32))
+//     println("${blake2s.digest_length(st)}")              // 32
+// ```
+pub @value
+struct B2sState
+    // The chaining value h[0..7], each masked to 32 bits.
+    h: [Int; 8]
+    // The message block being filled, as sixteen little-endian 32-bit
+    // words: byte `j` is bits `8*(j mod 4)` of word `j / 4`.
+    m: [Int; 16]
+    // The low half of the 64-bit byte counter.
+    t0: Int
+    // The high half of the 64-bit byte counter.
+    t1: Int
+    // The finalisation flag `f0`: 0xffffffff on the last block.
+    f0: Int
+    // The last-node flag `f1`: tree mode's, zero in sequential mode.
+    f1: Int
+    // Bytes of `m` that hold message: 0 ..= 64.
+    buffered: Int
+    // Bytes of digest this state will produce.
+    outlen: Int
+
+// The sixteen-word working vector one compression mixes.
+//
+// ```novo
+// use blake2s
+// use b2param
+//
+// fn main() [io]
+//     let w = blake2s.work(blake2s.init(b2param.sequential(32)))
+//     println("${blake2s.work_word(w, 8) == blake2s.iv(0)}")   // true
+// ```
+pub @value
+struct B2sWork
+    // v[0..15]: the chaining value, then the IV with `t` and `f`
+    // folded in.  Each masked to 32 bits.
+    v: [Int; 16]
+
+// ── The constants of the algorithm ───────────────────────────────────
+
+// IV word `i`, for `i` in 0 ..= 7: SHA-256's initial value.
+//
+// SHA-256's, where BLAKE2b takes SHA-512's — a difference that is easy
+// to state and easy to get wrong by copying the wrong eight numbers.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.iv(0) == 0x6a09e667}")             // true
+// ```
+pub fn iv(i: Int) -> Int []
+    todo("blake2-nv.blake2s.iv")
+
+// The message-word permutation σ[r][i], for `r` in 0 ..= 9 and `i` in
+// 0 ..= 15.
+//
+// The same table `blake2b.sigma` reads; BLAKE2s stops at row 9 because
+// it has ten rounds, where BLAKE2b wraps back to rows 0 and 1 for its
+// eleventh and twelfth.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.sigma(0, 0)}")                     // 0
+// ```
+pub fn sigma(r: Int, i: Int) -> Int []
+    todo("blake2-nv.blake2s.sigma")
+
+// Rotation amount `i`, for `i` in 0 ..= 3: 16, 12, 8, 7.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.rotation(3)}")                     // 7
+// ```
+pub fn rotation(i: Int) -> Int []
+    todo("blake2-nv.blake2s.rotation")
+
+// `x` rotated right by `n` bits, over 32, with the result masked.
+//
+// The rotation `blake2b.rotr` is not: a 32-bit rotate has to drop the
+// high half on the way through, and forgetting that is the defect this
+// function exists to have one home for.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.rotr(1, 1) == 0x80000000}")        // true
+// ```
+pub fn rotr(x: Int, n: Int) -> Int []
+    todo("blake2-nv.blake2s.rotr")
+
+// `x` masked to 32 bits.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.mask(0x1ffffffff)}")
+// ```
+pub fn mask(x: Int) -> Int []
+    todo("blake2-nv.blake2s.mask")
+
+// ── Building a state ─────────────────────────────────────────────────
+
+// A state with every word zero.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.buffered(blake2s.zero_state())}")  // 0
+// ```
+pub fn zero_state() -> B2sState []
+    todo("blake2-nv.blake2s.zero_state")
+
+// The state RFC 7693 § 2.6 starts from: h[i] = IV[i] XOR
+// `b2param.s_word(p, i)`.
+//
+// Takes the SAME `B2Params` BLAKE2b's `init` takes, and reads it
+// through `s_word` rather than `b_word` — which is the whole reason
+// the parameter block is one type and not two.  A caller who sets a
+// sixteen-byte salt and then initialises a BLAKE2s gets the low eight
+// bytes; `b2bytes.check_salt_s` is what refuses the width before that
+// can surprise anyone.
+//
+// ```novo
+// use blake2s
+// use b2param
+//
+// fn main() [io]
+//     println("${blake2s.counter_low(blake2s.init(b2param.sequential(32)))}")
+// ```
+pub fn init(p: B2Params) -> B2sState []
+    todo("blake2-nv.blake2s.init")
+
+// ── Reading and writing the state ────────────────────────────────────
+
+// Chaining word `i`, for `i` in 0 ..= 7.
+pub fn state_word(st: B2sState, i: Int) -> Int []
+    todo("blake2-nv.blake2s.state_word")
+
+// The same state with chaining word `i` set.
+pub fn with_state_word(st: B2sState, i: Int, v: Int) -> B2sState []
+    todo("blake2-nv.blake2s.with_state_word")
+
+// Message word `i` of the block being filled, for `i` in 0 ..= 15.
+pub fn block_word(st: B2sState, i: Int) -> Int []
+    todo("blake2-nv.blake2s.block_word")
+
+// The same state with message word `i` set.  Does not move
+// `buffered`.
+pub fn with_block_word(st: B2sState, i: Int, v: Int) -> B2sState []
+    todo("blake2-nv.blake2s.with_block_word")
+
+// Byte `j` of the block being filled, for `j` in 0 ..= 63.
+pub fn block_byte(st: B2sState, j: Int) -> Int []
+    todo("blake2-nv.blake2s.block_byte")
+
+// The same state with byte `j` of the block set.  Does not move
+// `buffered`.
+pub fn with_block_byte(st: B2sState, j: Int, b: Int) -> B2sState []
+    todo("blake2-nv.blake2s.with_block_byte")
+
+// Bytes of the block that hold message: 0 ..= 64.
+pub fn buffered(st: B2sState) -> Int []
+    todo("blake2-nv.blake2s.buffered")
+
+// The same state with `buffered` set.
+pub fn with_buffered(st: B2sState, n: Int) -> B2sState []
+    todo("blake2-nv.blake2s.with_buffered")
+
+// The same state with every block byte from `buffered` to the end set
+// to zero.
+pub fn zero_tail(st: B2sState) -> B2sState []
+    todo("blake2-nv.blake2s.zero_tail")
+
+// The low half of the byte counter.
+pub fn counter_low(st: B2sState) -> Int []
+    todo("blake2-nv.blake2s.counter_low")
+
+// The high half of the byte counter.
+pub fn counter_high(st: B2sState) -> Int []
+    todo("blake2-nv.blake2s.counter_high")
+
+// The same state with `n` added to the 64-bit byte counter, carrying
+// out of the low half at 2^32 rather than at 2^64 — the carry BLAKE2s
+// has and BLAKE2b, at this language's word width, does not.
+pub fn add_counter(st: B2sState, n: Int) -> B2sState []
+    todo("blake2-nv.blake2s.add_counter")
+
+// The same state with the byte counter set outright.
+pub fn with_counter(st: B2sState, lo: Int, hi: Int) -> B2sState []
+    todo("blake2-nv.blake2s.with_counter")
+
+// The same state with the finalisation flag `f0` set to 0xffffffff.
+pub fn mark_last(st: B2sState) -> B2sState []
+    todo("blake2-nv.blake2s.mark_last")
+
+// The same state with the last-node flag `f1` set to 0xffffffff.
+pub fn mark_last_node(st: B2sState) -> B2sState []
+    todo("blake2-nv.blake2s.mark_last_node")
+
+// Whether `f0` is set.
+pub fn is_last(st: B2sState) -> Bool []
+    todo("blake2-nv.blake2s.is_last")
+
+// Whether `f1` is set.
+pub fn is_last_node(st: B2sState) -> Bool []
+    todo("blake2-nv.blake2s.is_last_node")
+
+// Bytes of digest this state will produce.
+pub fn digest_length(st: B2sState) -> Int []
+    todo("blake2-nv.blake2s.digest_length")
+
+// ── The compression function ─────────────────────────────────────────
+
+// The working vector at the start of a compression.
+pub fn work(st: B2sState) -> B2sWork []
+    todo("blake2-nv.blake2s.work")
+
+// Working word `i`, for `i` in 0 ..= 15.
+pub fn work_word(w: B2sWork, i: Int) -> Int []
+    todo("blake2-nv.blake2s.work_word")
+
+// The same working vector with word `i` set.
+pub fn with_work_word(w: B2sWork, i: Int, v: Int) -> B2sWork []
+    todo("blake2-nv.blake2s.with_work_word")
+
+// The G mixing function at lanes `a`, `b`, `c`, `d` with message words
+// `x` and `y`, at BLAKE2s's rotations.
+//
+// ```novo
+// use blake2s
+// use b2param
+//
+// fn main() [io]
+//     let w = blake2s.work(blake2s.init(b2param.sequential(32)))
+//     println("${blake2s.work_word(blake2s.g(w, 0, 4, 8, 12, 0, 0), 0)}")
+// ```
+pub fn g(w: B2sWork, a: Int, b: Int, c: Int, d: Int, x: Int, y: Int) -> B2sWork []
+    todo("blake2-nv.blake2s.g")
+
+// One round: four column mixes and four diagonal mixes over the
+// message words σ[r] selects.
+pub fn round(w: B2sWork, st: B2sState, r: Int) -> B2sWork []
+    todo("blake2-nv.blake2s.round")
+
+// The compression function F: ten rounds, then h[i] = h[i] XOR v[i]
+// XOR v[i+8], every word masked to 32 bits.
+//
+// ```novo
+// use blake2s
+// use b2param
+//
+// fn main() [io]
+//     println("${blake2s.buffered(blake2s.compress(blake2s.init(b2param.sequential(32))))}")
+// ```
+pub fn compress(st: B2sState) -> B2sState []
+    todo("blake2-nv.blake2s.compress")
+
+// ── The streaming hash, with no `Bytes` in it ────────────────────────
+
+// One more byte of message, with BLAKE2's lazy buffering: a full block
+// is compressed when the NEXT byte arrives, never when it fills.
+//
+// ```novo
+// use blake2s
+// use b2param
+//
+// fn main() [io]
+//     println("${blake2s.buffered(blake2s.feed_byte(blake2s.init(b2param.sequential(32)), 0x61))}")
+// ```
+pub fn feed_byte(st: B2sState, b: Int) -> B2sState []
+    todo("blake2-nv.blake2s.feed_byte")
+
+// The last compression: zero the tail, advance the counter by the
+// bytes buffered, set `f0`, compress.
+//
+// ```novo
+// use blake2s
+// use b2param
+//
+// fn main() [io]
+//     println("${blake2s.is_last(blake2s.finish(blake2s.init(b2param.sequential(32))))}")
+// ```
+pub fn finish(st: B2sState) -> B2sState []
+    todo("blake2-nv.blake2s.finish")
+
+// Byte `i` of the digest, little-endian out of the chaining value.
+//
+// ```novo
+// use blake2s
+// use b2param
+//
+// fn main() [io]
+//     println("${blake2s.digest_byte(blake2s.finish(blake2s.init(b2param.sequential(32))), 0)}")
+// ```
+pub fn digest_byte(st: B2sState, i: Int) -> Int []
+    todo("blake2-nv.blake2s.digest_byte")

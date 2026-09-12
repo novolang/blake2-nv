@@ -1,0 +1,209 @@
+// blake2s_tests.nv — the 32-bit half, and the five ways it is not
+// BLAKE2b at half the width.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: blake2-nv.blake2s.<fn>`.
+// That is the expected result until the bodies land.
+//
+// WHAT THIS FILE IS FOR, beyond repeating the BLAKE2b file at another
+// width: the masking.  `Int` is 64 bits and BLAKE2s's word is 32, so
+// every sum and every rotation has to come back through
+// `B2S_WORD_MASK` — and a missing mask is a defect that produces
+// plausible numbers for a while and then diverges.  Every assertion
+// below that checks a word is in range is checking for that.
+
+use std.test
+use b2param
+use blake2s
+
+// `n` copies of `b`, fed one at a time — the same recursion the
+// BLAKE2b file uses, at this module's state type.
+fn feed_n(st: B2sState, b: Int, n: Int) -> B2sState
+    if n <= 0
+        st
+    else
+        feed_n(blake2s.feed_byte(st, b), b, n - 1)
+
+@test
+fn test_the_sizes_are_blake2s_and_not_blake2bs() [io]
+    test.case("eight chaining words, sixteen block words, 64 bytes, TEN rounds")
+    test.assert_eq(blake2s.B2S_STATE_WORDS, 8)
+    test.assert_eq(blake2s.B2S_BLOCK_WORDS, 16)
+    test.assert_eq(blake2s.B2S_BLOCK_BYTES, 64)
+    test.assert_eq(blake2s.B2S_WORK_WORDS, 16)
+    test.assert_eq(blake2s.B2S_ROUNDS, 10)
+    test.assert_eq(blake2s.B2S_DIGEST_BYTES_MOST, 32)
+    test.assert_eq(blake2s.B2S_WORD_MASK, 0xffffffff)
+
+@test
+fn test_the_iv_is_sha_256s_and_not_sha_512s() [io]
+    test.case("the eight words, in order, all inside 32 bits")
+    test.assert_eq(blake2s.iv(0), 0x6a09e667)
+    test.assert_eq(blake2s.iv(1), 0xbb67ae85)
+    test.assert_eq(blake2s.iv(2), 0x3c6ef372)
+    test.assert_eq(blake2s.iv(3), 0xa54ff53a)
+    test.assert_eq(blake2s.iv(4), 0x510e527f)
+    test.assert_eq(blake2s.iv(5), 0x9b05688c)
+    test.assert_eq(blake2s.iv(6), 0x1f83d9ab)
+    test.assert_eq(blake2s.iv(7), 0x5be0cd19)
+
+    test.case("every one is already masked, which is the module's invariant")
+    test.assert_eq(blake2s.mask(blake2s.iv(1)), blake2s.iv(1))
+    test.assert_eq(blake2s.mask(blake2s.iv(7)), blake2s.iv(7))
+
+@test
+fn test_mask_and_rotr_are_32_bit() [io]
+    test.case("mask drops everything above bit 31")
+    test.assert_eq(blake2s.mask(0x1ffffffff), 0xffffffff)
+    test.assert_eq(blake2s.mask(0x100000000), 0)
+    test.assert_eq(blake2s.mask(-1), 0xffffffff)
+
+    test.case("rotating 1 right by 1 gives 0x80000000 and NOT the 64-bit answer")
+    // The single defect this module exists to have one home for: a
+    // 64-bit rotate here gives 0x8000000000000000, which masks to 0
+    // and silently loses a bit on every round.
+    test.assert_eq(blake2s.rotr(1, 1), 0x80000000)
+    test.assert_eq(blake2s.rotr(0x12345678, 32), 0x12345678)
+    test.assert_eq(blake2s.rotr(blake2s.rotr(0x12345678, 12), 20), 0x12345678)
+
+@test
+fn test_the_rotations_are_16_12_8_7() [io]
+    test.case("BLAKE2s's R1..R4, which are not BLAKE2b's")
+    test.assert_eq(blake2s.rotation(0), 16)
+    test.assert_eq(blake2s.rotation(1), 12)
+    test.assert_eq(blake2s.rotation(2), 8)
+    test.assert_eq(blake2s.rotation(3), 7)
+
+@test
+fn test_sigma_is_the_same_table_truncated_to_ten_rows() [io]
+    test.case("row 0 is the identity and row 1 starts 14 10 4 8")
+    test.assert_eq(blake2s.sigma(0, 0), 0)
+    test.assert_eq(blake2s.sigma(0, 15), 15)
+    test.assert_eq(blake2s.sigma(1, 0), 14)
+    test.assert_eq(blake2s.sigma(1, 1), 10)
+    test.assert_eq(blake2s.sigma(1, 2), 4)
+    test.assert_eq(blake2s.sigma(1, 3), 8)
+
+    test.case("row 9 exists, and there is no row 10 to reach for")
+    test.assert(blake2s.sigma(9, 0) >= 0)
+    test.assert(blake2s.sigma(9, 15) <= 15)
+
+@test
+fn test_a_fresh_state_reads_the_parameter_block_through_s_word() [io]
+    test.case("h[i] = IV[i] XOR b2param.s_word(p, i)")
+    let p = b2param.sequential(32)
+    let st = blake2s.init(p)
+    test.assert_eq(blake2s.state_word(st, 0), blake2s.iv(0) ^ b2param.s_word(p, 0))
+    test.assert_eq(blake2s.state_word(st, 1), blake2s.iv(1))
+    test.assert_eq(blake2s.state_word(st, 7), blake2s.iv(7))
+
+    test.case("which is 0x6a09e667 XOR 0x01010020 for a 32-byte digest")
+    test.assert_eq(blake2s.state_word(st, 0), 0x6a09e667 ^ 0x01010020)
+
+    test.case("and the counter, the flags and the buffer start at zero")
+    test.assert_eq(blake2s.counter_low(st), 0)
+    test.assert_eq(blake2s.counter_high(st), 0)
+    test.assert(not blake2s.is_last(st))
+    test.assert(not blake2s.is_last_node(st))
+    test.assert_eq(blake2s.buffered(st), 0)
+    test.assert_eq(blake2s.digest_length(st), 32)
+
+@test
+fn test_the_block_is_filled_little_endian_at_four_bytes_a_word() [io]
+    test.case("byte j lives at bits 8*(j mod 4) of word j/4 — FOUR, not eight")
+    var st = blake2s.zero_state()
+    st = blake2s.with_block_byte(st, 0, 0x11)
+    st = blake2s.with_block_byte(st, 1, 0x22)
+    st = blake2s.with_block_byte(st, 4, 0x33)
+    test.assert_eq(blake2s.block_byte(st, 0), 0x11)
+    test.assert_eq(blake2s.block_word(st, 0) & 0xffff, 0x2211)
+    test.assert_eq(blake2s.block_word(st, 1) & 0xff, 0x33)
+
+    test.case("a word written whole reads back byte by byte the same way")
+    let w = blake2s.with_block_word(blake2s.zero_state(), 0, 0x04030201)
+    test.assert_eq(blake2s.block_byte(w, 0), 0x01)
+    test.assert_eq(blake2s.block_byte(w, 3), 0x04)
+
+    test.case("zero_tail clears from `buffered` to the end")
+    let z = blake2s.zero_tail(blake2s.with_buffered(w, 1))
+    test.assert_eq(blake2s.block_byte(z, 0), 0x01)
+    test.assert_eq(blake2s.block_byte(z, 1), 0)
+    test.assert_eq(blake2s.block_word(z, 15), 0)
+
+@test
+fn test_the_counter_carries_at_two_to_the_thirty_two() [io]
+    test.case("the carry BLAKE2s has and BLAKE2b, at this word width, does not")
+    // BLAKE2s's counter is two 32-bit halves, so the low one wraps at
+    // 2^32 — a message of 4 GiB, which is reachable, unlike BLAKE2b's
+    // 2^64.
+    let st = blake2s.add_counter(blake2s.with_counter(blake2s.zero_state(), 0xffffffff, 0), 1)
+    test.assert_eq(blake2s.counter_low(st), 0)
+    test.assert_eq(blake2s.counter_high(st), 1)
+
+    test.case("and a small add stays in the low half")
+    test.assert_eq(blake2s.counter_low(blake2s.add_counter(blake2s.zero_state(), 64)), 64)
+    test.assert_eq(blake2s.counter_high(blake2s.add_counter(blake2s.zero_state(), 64)), 0)
+
+@test
+fn test_the_flags_are_separate_here_too() [io]
+    test.case("mark_last sets f0, mark_last_node sets f1")
+    test.assert(blake2s.is_last(blake2s.mark_last(blake2s.zero_state())))
+    test.assert(not blake2s.is_last_node(blake2s.mark_last(blake2s.zero_state())))
+    test.assert(blake2s.is_last_node(blake2s.mark_last_node(blake2s.zero_state())))
+    test.assert(not blake2s.is_last(blake2s.mark_last_node(blake2s.zero_state())))
+
+@test
+fn test_the_working_vector_and_the_round_functions() [io]
+    test.case("v[0..7] = h, v[8..15] = IV, with t and f folded into 12..15")
+    let st = blake2s.with_counter(blake2s.init(b2param.sequential(32)), 5, 0)
+    let w = blake2s.work(st)
+    test.assert_eq(blake2s.work_word(w, 0), blake2s.state_word(st, 0))
+    test.assert_eq(blake2s.work_word(w, 8), blake2s.iv(0))
+    test.assert_eq(blake2s.work_word(w, 12), blake2s.iv(4) ^ 5)
+    test.assert_eq(blake2s.work_word(w, 13), blake2s.iv(5))
+
+    test.case("every working word stays inside 32 bits")
+    test.assert_eq(blake2s.mask(blake2s.work_word(w, 12)), blake2s.work_word(w, 12))
+
+    test.case("a working word can be set")
+    test.assert_eq(blake2s.work_word(blake2s.with_work_word(w, 3, 99), 3), 99)
+
+    test.case("G and a round move the vector and stay masked")
+    let g = blake2s.g(w, 0, 4, 8, 12, 0, 0)
+    test.assert(blake2s.work_word(g, 0) != blake2s.work_word(w, 0))
+    test.assert_eq(blake2s.mask(blake2s.work_word(g, 0)), blake2s.work_word(g, 0))
+    let r = blake2s.round(w, st, 0)
+    test.assert(blake2s.work_word(r, 15) != blake2s.work_word(w, 15))
+
+    test.case("compress feeds forward, empties the buffer and stays masked")
+    let c = blake2s.compress(blake2s.with_buffered(st, 64))
+    test.assert(blake2s.state_word(c, 0) != blake2s.state_word(st, 0))
+    test.assert_eq(blake2s.buffered(c), 0)
+    test.assert_eq(blake2s.mask(blake2s.state_word(c, 0)), blake2s.state_word(c, 0))
+
+@test
+fn test_lazy_buffering_at_a_sixty_four_byte_block() [io]
+    test.case("64 bytes fed leaves a full buffer and an unmoved counter")
+    let st = feed_n(blake2s.init(b2param.sequential(32)), 0x61, 64)
+    test.assert_eq(blake2s.buffered(st), 64)
+    test.assert_eq(blake2s.counter_low(st), 0)
+
+    test.case("the 65th byte compresses the first block")
+    test.assert_eq(blake2s.counter_low(blake2s.feed_byte(st, 0x62)), 64)
+    test.assert_eq(blake2s.buffered(blake2s.feed_byte(st, 0x62)), 1)
+
+    test.case("finishing instead sets f0 and counts the 64")
+    let done = blake2s.finish(st)
+    test.assert(blake2s.is_last(done))
+    test.assert_eq(blake2s.counter_low(done), 64)
+
+@test
+fn test_a_finished_state_reads_out_little_endian() [io]
+    test.case("digest byte i is byte i mod 4 of chaining word i/4")
+    let st = blake2s.finish(blake2s.init(b2param.sequential(32)))
+    test.assert_eq(blake2s.digest_byte(st, 0), blake2s.state_word(st, 0) & 0xff)
+    test.assert_eq(blake2s.digest_byte(st, 4), blake2s.state_word(st, 1) & 0xff)
+
+    test.case("a state can be rebuilt word by word")
+    test.assert_eq(blake2s.state_word(blake2s.with_state_word(blake2s.zero_state(), 3, 0x11223344), 3),
+        0x11223344)

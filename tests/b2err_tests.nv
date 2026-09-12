@@ -1,0 +1,45 @@
+// b2err_tests.nv — the error type, whose whole content is that BLAKE2
+// itself cannot fail.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: blake2-nv.b2err.<fn>`.
+// That is the expected result until the bodies land.
+
+use std.test
+use b2err
+
+@test
+fn test_every_arm_says_something_a_caller_can_act_on() [io]
+    test.case("a description is not empty, and names the numbers")
+    test.assert(b2err.describe(B2DigestLengthOutOfRange(65, 64)) != "")
+    test.assert(b2err.describe(B2KeyTooLong(80, 64)) != "")
+    test.assert(b2err.describe(B2SaltWidthWrong(8, 16)) != "")
+    test.assert(b2err.describe(B2PersonalWidthWrong(8, 16)) != "")
+    test.assert(b2err.describe(B2OutputTooSmall(32, 16)) != "")
+    test.assert(b2err.describe(B2TreeModeNotDriven(4, 2)) != "")
+
+    test.case("two different widths do not describe to the same sentence")
+    test.assert(b2err.describe(B2KeyTooLong(80, 64)) != b2err.describe(B2KeyTooLong(65, 64)))
+
+@test
+fn test_the_error_trait_and_the_free_function_agree() [io]
+    test.case("`message` is what `describe` answers")
+    // `Result<_, B2Error>` needs the impl; a caller holding a bare
+    // error value needs the free function.  They are one sentence.
+    let e = B2OutputTooSmall(64, 32)
+    test.assert_eq(e.message(), b2err.describe(e))
+
+@test
+fn test_a_width_fault_is_told_apart_from_a_mode_this_package_does_not_drive() [io]
+    test.case("every width arm is a width fault")
+    test.assert(b2err.is_width_fault(B2DigestLengthOutOfRange(0, 64)))
+    test.assert(b2err.is_width_fault(B2KeyTooLong(65, 64)))
+    test.assert(b2err.is_width_fault(B2SaltWidthWrong(1, 16)))
+    test.assert(b2err.is_width_fault(B2PersonalWidthWrong(1, 16)))
+    test.assert(b2err.is_width_fault(B2OutputTooSmall(64, 1)))
+
+    test.case("a tree block is not — it is a feature scoped out, and the repair differs")
+    // A width is a bug in the call; a tree mode is something the
+    // caller drives themselves out of `b2param` and `blake2b`, and the
+    // README says how.
+    test.assert(not b2err.is_width_fault(B2TreeModeNotDriven(4, 2)))

@@ -1,0 +1,175 @@
+// b2param_tests.nv — the parameter block, which is where a BLAKE2 port
+// goes wrong before it has computed anything.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: blake2-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// WHY THIS FILE IS FIRST.  The parameter block decides the initial
+// chaining value, so a wrong block is a wrong hash for every input —
+// and unlike a wrong rotation it produces a value that is internally
+// consistent, round-trips through this package, and disagrees only
+// with everybody else.  The layout assertions below are RFC 7693
+// § 2.8's table, field by field.
+
+use std.test
+use b2param
+
+@test
+fn test_the_widths_are_the_rfcs() [io]
+    test.case("BLAKE2b: 64-byte digest, 64-byte key, 16-byte salt and personalisation")
+    test.assert_eq(b2param.B2B_OUT_BYTES_MOST, 64)
+    test.assert_eq(b2param.B2B_KEY_BYTES_MOST, 64)
+    test.assert_eq(b2param.B2B_SALT_BYTES, 16)
+    test.assert_eq(b2param.B2B_PERSONAL_BYTES, 16)
+
+    test.case("BLAKE2s: 32-byte digest, 32-byte key, 8-byte salt and personalisation")
+    test.assert_eq(b2param.B2S_OUT_BYTES_MOST, 32)
+    test.assert_eq(b2param.B2S_KEY_BYTES_MOST, 32)
+    test.assert_eq(b2param.B2S_SALT_BYTES, 8)
+    test.assert_eq(b2param.B2S_PERSONAL_BYTES, 8)
+
+    test.case("one byte is the shortest digest either admits")
+    test.assert_eq(b2param.B2_OUT_BYTES_LEAST, 1)
+
+    test.case("both parameter blocks are eight words, at different widths")
+    test.assert_eq(b2param.B2B_PARAM_WORDS, 8)
+    test.assert_eq(b2param.B2S_PARAM_WORDS, 8)
+
+@test
+fn test_sequential_is_fanout_one_depth_one_and_nothing_else() [io]
+    test.case("RFC 7693 section 2.8: sequential mode sets fanout and depth to 1")
+    let p = b2param.sequential(32)
+    test.assert_eq(b2param.digest_length(p), 32)
+    test.assert_eq(b2param.key_length(p), 0)
+    test.assert_eq(b2param.fanout(p), 1)
+    test.assert_eq(b2param.depth(p), 1)
+
+    test.case("and leaves every tree field zero")
+    test.assert_eq(b2param.leaf_length(p), 0)
+    test.assert_eq(b2param.node_offset(p), 0)
+    test.assert_eq(b2param.node_depth(p), 0)
+    test.assert_eq(b2param.inner_length(p), 0)
+
+    test.case("and leaves the salt and the personalisation zero")
+    test.assert_eq(b2param.salt_lo(p), 0)
+    test.assert_eq(b2param.salt_hi(p), 0)
+    test.assert_eq(b2param.personal_lo(p), 0)
+    test.assert_eq(b2param.personal_hi(p), 0)
+
+    test.case("`is_sequential` agrees")
+    test.assert(b2param.is_sequential(p))
+
+@test
+fn test_a_zero_length_key_is_the_unkeyed_block() [io]
+    test.case("keyed(n, 0) and sequential(n) are the same parameter block")
+    // The property a caller relies on when the key is optional: one
+    // code path, and no branch on whether there is a key.
+    let a = b2param.keyed(32, 0)
+    let b = b2param.sequential(32)
+    test.assert_eq(b2param.b_word(a, 0), b2param.b_word(b, 0))
+    test.assert_eq(b2param.s_word(a, 0), b2param.s_word(b, 0))
+
+    test.case("a key length shows up in the block")
+    test.assert_eq(b2param.key_length(b2param.keyed(32, 32)), 32)
+
+@test
+fn test_the_digest_length_is_in_word_zero() [io]
+    test.case("byte 0 of the parameter block is the digest length")
+    // This is the whole reason BLAKE2b-256 is not BLAKE2b-512
+    // truncated: the number below is XORed into h[0] before a byte of
+    // message is seen.
+    test.assert_eq(b2param.b_word(b2param.sequential(32), 0) & 0xff, 32)
+    test.assert_eq(b2param.b_word(b2param.sequential(64), 0) & 0xff, 64)
+    test.assert_eq(b2param.s_word(b2param.sequential(32), 0) & 0xff, 32)
+
+    test.case("byte 1 is the key length, byte 2 the fanout, byte 3 the depth")
+    let k = b2param.keyed(64, 64)
+    test.assert_eq((b2param.b_word(k, 0) >> 8) & 0xff, 64)
+    test.assert_eq((b2param.b_word(k, 0) >> 16) & 0xff, 1)
+    test.assert_eq((b2param.b_word(k, 0) >> 24) & 0xff, 1)
+
+    test.case("the sequential block's word 0 is 0x01010000 | outlen for BLAKE2s")
+    // The number every BLAKE2s implementation has hard-coded
+    // somewhere, here derived rather than written down.
+    test.assert_eq(b2param.s_word(b2param.sequential(32), 0), 0x01010020)
+
+@test
+fn test_with_digest_length_replaces_only_that_field() [io]
+    test.case("a re-lengthened block keeps its key length and its mode")
+    let p = b2param.with_digest_length(b2param.keyed(64, 32), 33)
+    test.assert_eq(b2param.digest_length(p), 33)
+    test.assert_eq(b2param.key_length(p), 32)
+    test.assert(b2param.is_sequential(p))
+
+@test
+fn test_the_salt_and_the_personalisation_are_the_last_four_words() [io]
+    test.case("BLAKE2b: salt in words 4 and 5, personalisation in 6 and 7")
+    let p = b2param.with_personal(b2param.with_salt(b2param.sequential(32), 11, 22), 33, 44)
+    test.assert_eq(b2param.salt_lo(p), 11)
+    test.assert_eq(b2param.salt_hi(p), 22)
+    test.assert_eq(b2param.personal_lo(p), 33)
+    test.assert_eq(b2param.personal_hi(p), 44)
+    test.assert_eq(b2param.b_word(p, 4), 11)
+    test.assert_eq(b2param.b_word(p, 5), 22)
+    test.assert_eq(b2param.b_word(p, 6), 33)
+    test.assert_eq(b2param.b_word(p, 7), 44)
+
+    test.case("BLAKE2s: the salt is words 4 and 5 of a 32-bit block, so only the low half travels")
+    // The difference that makes one parameter type serve two
+    // algorithms, and the one a caller has to know about: sixteen
+    // bytes of BLAKE2b salt is eight bytes of BLAKE2s salt and the
+    // width check is what stops that being a surprise.
+    let q = b2param.with_salt(b2param.sequential(32), 0x0102030405060708, 0)
+    test.assert_eq(b2param.s_word(q, 4), 0x05060708)
+    test.assert_eq(b2param.s_word(q, 5), 0x01020304)
+
+@test
+fn test_a_tree_block_is_buildable_and_is_not_sequential() [io]
+    test.case("with_tree sets the six fields the specification names")
+    let p = b2param.with_tree(b2param.sequential(64), 4, 2, 4096, 7, 1, 64)
+    test.assert_eq(b2param.fanout(p), 4)
+    test.assert_eq(b2param.depth(p), 2)
+    test.assert_eq(b2param.leaf_length(p), 4096)
+    test.assert_eq(b2param.node_offset(p), 7)
+    test.assert_eq(b2param.node_depth(p), 1)
+    test.assert_eq(b2param.inner_length(p), 64)
+
+    test.case("and `is_sequential` says no, which is what the one-shots refuse on")
+    test.assert(not b2param.is_sequential(p))
+
+    test.case("BLAKE2s spills node_offset out of word 2 into word 3")
+    // Six bytes, not eight: the layout difference a port that reuses
+    // BLAKE2b's packing gets wrong.
+    let s = b2param.with_tree(b2param.sequential(32), 1, 1, 0, 0x010203040506, 0, 0)
+    test.assert_eq(b2param.s_word(s, 2), 0x03040506)
+    test.assert_eq(b2param.s_word(s, 3) & 0xffff, 0x0102)
+
+@test
+fn test_the_checks_refuse_the_widths_the_algorithms_refuse() [io]
+    test.case("BLAKE2b admits 1 ..= 64 bytes of digest")
+    match b2param.check_b(b2param.sequential(64))
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+    match b2param.check_b(b2param.sequential(65))
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+    match b2param.check_b(b2param.sequential(0))
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+
+    test.case("BLAKE2s admits 1 ..= 32, so a 64-byte block is refused there and not here")
+    match b2param.check_s(b2param.sequential(32))
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+    match b2param.check_s(b2param.sequential(64))
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+
+    test.case("a key longer than the algorithm's is refused")
+    match b2param.check_b(b2param.keyed(32, 65))
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+    match b2param.check_s(b2param.keyed(32, 33))
+        Some(_) => test.assert(true)
+        None    => test.assert(false)

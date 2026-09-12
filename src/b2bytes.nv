@@ -1,0 +1,510 @@
+// b2bytes.nv — the bridge: `Bytes` in, a caller's buffer out, and the
+// width checks that have to run before a `@value` is built.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THIS IS THE HALF A SERVER GETS.  `blake2b` and `blake2s` speak words
+// and inline arrays and are in the device claim; this module speaks
+// `Bytes`, which is a heap object, and is not.  Everything here is a
+// few lines over the two modules below it — the key block, the chunk
+// loop, the little-endian read-out — and that is the whole difference
+// between the two halves.
+//
+// THE DIGEST LENGTH IS THE OUTPUT BUFFER'S LENGTH, in every function
+// here, and that is a deliberate refusal to offer a second number.
+// BLAKE2's digest length is part of its INITIAL STATE (`b2param`), so
+// "hash at 64 and give me the first 32 bytes" is a different value
+// from BLAKE2b-256 — not a truncation of it, a different hash.  A
+// signature with both a length and a buffer invites exactly that
+// mistake and cannot detect it.  With one number there is nothing to
+// get wrong: `bytes.zeros(33)` asks for BLAKE2b-264 and gets it.
+//
+// KEYED BLAKE2 IS THE MAC.  There is no HMAC construction over this
+// package and there should not be one: RFC 7693 § 1 says BLAKE2 may be
+// keyed directly, and wrapping it in HMAC would double the cost and
+// weaken nothing.  `blake2b_keyed_into` IS the MAC, and PASETO v4's
+// tag is a call to it.
+//
+// WHAT THIS MODULE DOES NOT DO is compare.  A MAC verification is a
+// constant-time comparison, and the one on the grid is crypto-nv's
+// `digest.ct_eq`.  Taking a dependency here for one function would put
+// crypto-nv in the link graph of every device that wants a hash, so
+// the README names the call instead and a consumer that verifies a tag
+// already depends on crypto-nv for something else.
+
+use std.bytes
+use b2param
+use blake2b
+use blake2s
+
+// ── The width checks ─────────────────────────────────────────────────
+//
+// Each answers `?B2Error` and each runs BEFORE a `@value` is built,
+// because an unboxed struct may not be a `Result` payload (SPEC
+// § 14.5) and so a constructor cannot refuse.
+
+// Whether `n` is a digest length BLAKE2b admits: 1 ..= 64.
+//
+// ```novo
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.check_digest_length_b(0)
+//         Some(_) => println("refused")
+//         None => println("ok")
+// ```
+pub fn check_digest_length_b(n: Int) -> ?B2Error []
+    todo("blake2-nv.b2bytes.check_digest_length_b")
+
+// Whether `n` is a digest length BLAKE2s admits: 1 ..= 32.
+//
+// ```novo
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.check_digest_length_s(32)
+//         Some(_) => println("refused")
+//         None => println("ok")
+// ```
+pub fn check_digest_length_s(n: Int) -> ?B2Error []
+    todo("blake2-nv.b2bytes.check_digest_length_s")
+
+// Whether `key` is a length BLAKE2b admits: 0 ..= 64.
+//
+// Empty is the unkeyed mode and is not an error.
+//
+// ```novo
+// use std.bytes
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.check_key_b(bytes.zeros(32))
+//         Some(_) => println("refused")
+//         None => println("ok")
+// ```
+pub fn check_key_b(key: Bytes) -> ?B2Error []
+    todo("blake2-nv.b2bytes.check_key_b")
+
+// Whether `key` is a length BLAKE2s admits: 0 ..= 32.
+//
+// ```novo
+// use std.bytes
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.check_key_s(bytes.zeros(32))
+//         Some(_) => println("refused")
+//         None => println("ok")
+// ```
+pub fn check_key_s(key: Bytes) -> ?B2Error []
+    todo("blake2-nv.b2bytes.check_key_s")
+
+// Whether `salt` is BLAKE2b's width: empty, or exactly 16 bytes.
+//
+// Exactly, not at most — a short salt would be a salt followed by
+// zeros, which is a different parameter block than the caller meant.
+//
+// ```novo
+// use std.bytes
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.check_salt_b(bytes.zeros(8))
+//         Some(_) => println("refused")
+//         None => println("ok")
+// ```
+pub fn check_salt_b(salt: Bytes) -> ?B2Error []
+    todo("blake2-nv.b2bytes.check_salt_b")
+
+// Whether `salt` is BLAKE2s's width: empty, or exactly 8 bytes.
+//
+// ```novo
+// use std.bytes
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.check_salt_s(bytes.zeros(8))
+//         Some(_) => println("refused")
+//         None => println("ok")
+// ```
+pub fn check_salt_s(salt: Bytes) -> ?B2Error []
+    todo("blake2-nv.b2bytes.check_salt_s")
+
+// Whether `personal` is BLAKE2b's width: empty, or exactly 16 bytes.
+//
+// ```novo
+// use std.bytes
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.check_personal_b(bytes.zeros(16))
+//         Some(_) => println("refused")
+//         None => println("ok")
+// ```
+pub fn check_personal_b(personal: Bytes) -> ?B2Error []
+    todo("blake2-nv.b2bytes.check_personal_b")
+
+// Whether `personal` is BLAKE2s's width: empty, or exactly 8 bytes.
+//
+// ```novo
+// use std.bytes
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.check_personal_s(bytes.zeros(8))
+//         Some(_) => println("refused")
+//         None => println("ok")
+// ```
+pub fn check_personal_s(personal: Bytes) -> ?B2Error []
+    todo("blake2-nv.b2bytes.check_personal_s")
+
+// Every BLAKE2b width in one call, answering the FIRST problem.
+//
+// One call rather than four, for the caller that has all four inputs
+// in hand and wants one refusal to report.  The order is digest
+// length, key, salt, personalisation.
+//
+// ```novo
+// use std.bytes
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.check_inputs_b(32, bytes.zeros(0), bytes.zeros(0), bytes.zeros(0))
+//         Some(_) => println("refused")
+//         None => println("ok")
+// ```
+pub fn check_inputs_b(digest_length: Int, key: Bytes, salt: Bytes, personal: Bytes) -> ?B2Error []
+    todo("blake2-nv.b2bytes.check_inputs_b")
+
+// Every BLAKE2s width in one call, answering the first problem.
+//
+// ```novo
+// use std.bytes
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.check_inputs_s(32, bytes.zeros(0), bytes.zeros(0), bytes.zeros(0))
+//         Some(_) => println("refused")
+//         None => println("ok")
+// ```
+pub fn check_inputs_s(digest_length: Int, key: Bytes, salt: Bytes, personal: Bytes) -> ?B2Error []
+    todo("blake2-nv.b2bytes.check_inputs_s")
+
+// ── Building a parameter block out of `Bytes` ────────────────────────
+
+// A BLAKE2b parameter block from a digest length and up to three byte
+// strings.
+//
+// Trusts its arguments: call `check_inputs_b` first.  An empty salt or
+// personalisation means "none", which is the zero the parameter block
+// already holds.
+//
+// ```novo
+// use std.bytes
+// use b2param
+// use b2bytes
+//
+// fn main() [io]
+//     let p = b2bytes.params_b(32, bytes.zeros(32), bytes.zeros(0), bytes.zeros(0))
+//     println("${b2param.key_length(p)}")                  // 32
+// ```
+pub fn params_b(digest_length: Int, key: Bytes, salt: Bytes, personal: Bytes) -> B2Params []
+    todo("blake2-nv.b2bytes.params_b")
+
+// A BLAKE2s parameter block from a digest length and up to three byte
+// strings.
+//
+// ```novo
+// use std.bytes
+// use b2param
+// use b2bytes
+//
+// fn main() [io]
+//     let p = b2bytes.params_s(32, bytes.zeros(0), bytes.zeros(8), bytes.zeros(0))
+//     println("${b2param.digest_length(p)}")               // 32
+// ```
+pub fn params_s(digest_length: Int, key: Bytes, salt: Bytes, personal: Bytes) -> B2Params []
+    todo("blake2-nv.b2bytes.params_s")
+
+// The eight bytes at `off`, read as a little-endian 64-bit word.
+//
+// Published because a caller building a parameter block or a state out
+// of raw bytes needs it, and because it is the one place the byte
+// order this whole package is little-endian in is written down.
+//
+// ```novo
+// use std.bytes
+// use b2bytes
+//
+// fn main() [io]
+//     println("${b2bytes.word_le(bytes.zeros(8), 0)}")     // 0
+// ```
+pub fn word_le(src: Bytes, off: Int) -> Int []
+    todo("blake2-nv.b2bytes.word_le")
+
+// The four bytes at `off`, read as a little-endian 32-bit word.
+//
+// ```novo
+// use std.bytes
+// use b2bytes
+//
+// fn main() [io]
+//     println("${b2bytes.word_le32(bytes.zeros(4), 0)}")   // 0
+// ```
+pub fn word_le32(src: Bytes, off: Int) -> Int []
+    todo("blake2-nv.b2bytes.word_le32")
+
+// ── Starting a keyed hash ────────────────────────────────────────────
+
+// A BLAKE2b state with the key's block already absorbed.
+//
+// RFC 7693 § 3.3: a keyed hash puts the key, zero-padded to a full 128
+// bytes, in front of the message — so this is `blake2b.init(p)`
+// followed by one full block, and a keyed hash of the EMPTY message
+// still compresses once.  A port that sets `key_length` and skips the
+// block produces a number nothing else computes, which is why the
+// keyed vectors are in the test file rather than optional.
+//
+// `p` must already declare the key's length; `params_b` does that.
+//
+// ```novo
+// use std.bytes
+// use blake2b
+// use b2bytes
+//
+// fn main() [io]
+//     let p = b2bytes.params_b(32, bytes.zeros(32), bytes.zeros(0), bytes.zeros(0))
+//     let st = b2bytes.init_keyed_b(p, bytes.zeros(32))
+//     println("${blake2b.counter_low(st)}")
+// ```
+pub fn init_keyed_b(p: B2Params, key: Bytes) -> B2bState []
+    todo("blake2-nv.b2bytes.init_keyed_b")
+
+// A BLAKE2s state with the key's block already absorbed — the same
+// rule at a 64-byte block.
+//
+// ```novo
+// use std.bytes
+// use blake2s
+// use b2bytes
+//
+// fn main() [io]
+//     let p = b2bytes.params_s(32, bytes.zeros(32), bytes.zeros(0), bytes.zeros(0))
+//     println("${blake2s.counter_low(b2bytes.init_keyed_s(p, bytes.zeros(32)))}")
+// ```
+pub fn init_keyed_s(p: B2Params, key: Bytes) -> B2sState []
+    todo("blake2-nv.b2bytes.init_keyed_s")
+
+// ── Feeding and finishing ────────────────────────────────────────────
+
+// A chunk of message into a BLAKE2b state.
+//
+// Chunking is invisible: feeding "ab" then "c" and feeding "abc"
+// produce the same state, which is what the streaming test asserts at
+// every boundary around 128.
+//
+// ```novo
+// use std.bytes
+// use b2param
+// use blake2b
+// use b2bytes
+//
+// fn main() [io]
+//     let st = b2bytes.update_b(blake2b.init(b2param.sequential(32)), bytes.from_str("abc"))
+//     println("${blake2b.buffered(st)}")                   // 3
+// ```
+pub fn update_b(st: B2bState, chunk: Bytes) -> B2bState []
+    todo("blake2-nv.b2bytes.update_b")
+
+// A chunk of message into a BLAKE2s state.
+//
+// ```novo
+// use std.bytes
+// use b2param
+// use blake2s
+// use b2bytes
+//
+// fn main() [io]
+//     let st = b2bytes.update_s(blake2s.init(b2param.sequential(32)), bytes.from_str("abc"))
+//     println("${blake2s.buffered(st)}")                   // 3
+// ```
+pub fn update_s(st: B2sState, chunk: Bytes) -> B2sState []
+    todo("blake2-nv.b2bytes.update_s")
+
+// `n` bytes at `off` of `chunk` into a BLAKE2b state.
+//
+// The form that hashes part of a buffer without slicing it, which a
+// caller reading fixed-size blocks into one scratch buffer needs and
+// which is the difference between one allocation and one per block.
+//
+// ```novo
+// use std.bytes
+// use b2param
+// use blake2b
+// use b2bytes
+//
+// fn main() [io]
+//     let st = b2bytes.update_range_b(blake2b.init(b2param.sequential(32)), bytes.zeros(64), 0, 16)
+//     println("${blake2b.buffered(st)}")                   // 16
+// ```
+pub fn update_range_b(st: B2bState, chunk: Bytes, off: Int, n: Int) -> B2bState []
+    todo("blake2-nv.b2bytes.update_range_b")
+
+// `n` bytes at `off` of `chunk` into a BLAKE2s state.
+//
+// ```novo
+// use std.bytes
+// use b2param
+// use blake2s
+// use b2bytes
+//
+// fn main() [io]
+//     let st = b2bytes.update_range_s(blake2s.init(b2param.sequential(32)), bytes.zeros(64), 0, 16)
+//     println("${blake2s.buffered(st)}")                   // 16
+// ```
+pub fn update_range_s(st: B2sState, chunk: Bytes, off: Int, n: Int) -> B2sState []
+    todo("blake2-nv.b2bytes.update_range_s")
+
+// Finish a BLAKE2b and write the digest into `out`.
+//
+// Answers the written prefix of `out`, the way crypto-nv's
+// `sha256_finish` does, so a caller can pass the answer straight on.
+// `out` must have room for the state's digest length, and a buffer
+// LONGER than the digest length is not an error — the extra bytes are
+// untouched and the answer names the prefix.
+//
+// ```novo
+// use std.bytes
+// use b2param
+// use blake2b
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.finish_into_b(blake2b.init(b2param.sequential(32)), bytes.zeros(32))
+//         Ok(d) => println("${bytes.len(d)}")
+//         Err(_) => println("refused")
+// ```
+pub fn finish_into_b(st: B2bState, out: Bytes) -> Result<Bytes, B2Error> []
+    todo("blake2-nv.b2bytes.finish_into_b")
+
+// Finish a BLAKE2s and write the digest into `out`.
+//
+// ```novo
+// use std.bytes
+// use b2param
+// use blake2s
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.finish_into_s(blake2s.init(b2param.sequential(32)), bytes.zeros(32))
+//         Ok(d) => println("${bytes.len(d)}")
+//         Err(_) => println("refused")
+// ```
+pub fn finish_into_s(st: B2sState, out: Bytes) -> Result<Bytes, B2Error> []
+    todo("blake2-nv.b2bytes.finish_into_s")
+
+// ── The one-shots ────────────────────────────────────────────────────
+
+// BLAKE2b of `msg` into `out`, at a digest length of `out`'s length.
+//
+// The call Argon2's initial hash H is: sixty-four bytes of output over
+// the concatenated parameters.  Its variable-length H′ is this
+// function at a length below 64, and a chain of it above.
+//
+// ```novo
+// use std.bytes
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.blake2b_into(bytes.from_str("abc"), bytes.zeros(64))
+//         Ok(d) => println("${bytes.len(d)}")              // 64
+//         Err(_) => println("refused")
+// ```
+pub fn blake2b_into(msg: Bytes, out: Bytes) -> Result<Bytes, B2Error> []
+    todo("blake2-nv.b2bytes.blake2b_into")
+
+// BLAKE2s of `msg` into `out`, at a digest length of `out`'s length.
+//
+// ```novo
+// use std.bytes
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.blake2s_into(bytes.from_str("abc"), bytes.zeros(32))
+//         Ok(d) => println("${bytes.len(d)}")              // 32
+//         Err(_) => println("refused")
+// ```
+pub fn blake2s_into(msg: Bytes, out: Bytes) -> Result<Bytes, B2Error> []
+    todo("blake2-nv.b2bytes.blake2s_into")
+
+// Keyed BLAKE2b of `msg` under `key`, into `out`.  This is the MAC.
+//
+// PASETO v4's three calls are all this function: the key split
+// (56 bytes out), the auth subkey (32) and the tag (32).  No HMAC
+// wrapper is needed or wanted — RFC 7693 § 1 keys BLAKE2 directly.
+//
+// ```novo
+// use std.bytes
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.blake2b_keyed_into(bytes.zeros(32), bytes.from_str("abc"), bytes.zeros(32))
+//         Ok(t) => println("${bytes.len(t)}")              // 32
+//         Err(_) => println("refused")
+// ```
+pub fn blake2b_keyed_into(key: Bytes, msg: Bytes, out: Bytes) -> Result<Bytes, B2Error> []
+    todo("blake2-nv.b2bytes.blake2b_keyed_into")
+
+// Keyed BLAKE2s of `msg` under `key`, into `out`.
+//
+// ```novo
+// use std.bytes
+// use b2bytes
+//
+// fn main() [io]
+//     match b2bytes.blake2s_keyed_into(bytes.zeros(32), bytes.from_str("abc"), bytes.zeros(32))
+//         Ok(t) => println("${bytes.len(t)}")              // 32
+//         Err(_) => println("refused")
+// ```
+pub fn blake2s_keyed_into(key: Bytes, msg: Bytes, out: Bytes) -> Result<Bytes, B2Error> []
+    todo("blake2-nv.b2bytes.blake2s_keyed_into")
+
+// BLAKE2b of `msg` under a caller-built parameter block, into `out`.
+//
+// The salted-and-personalised form, and the escape hatch for anything
+// the two convenience one-shots do not cover.  Refuses a parameter
+// block whose `digest_length` disagrees with `out`'s length, and
+// refuses a tree block with `B2TreeModeNotDriven`.
+//
+// ```novo
+// use std.bytes
+// use b2param
+// use b2bytes
+//
+// fn main() [io]
+//     let p = b2param.with_personal(b2param.sequential(32), 7, 0)
+//     match b2bytes.blake2b_full_into(p, bytes.zeros(0), bytes.from_str("abc"), bytes.zeros(32))
+//         Ok(d) => println("${bytes.len(d)}")              // 32
+//         Err(_) => println("refused")
+// ```
+pub fn blake2b_full_into(p: B2Params, key: Bytes, msg: Bytes,
+                         out: Bytes) -> Result<Bytes, B2Error> []
+    todo("blake2-nv.b2bytes.blake2b_full_into")
+
+// BLAKE2s of `msg` under a caller-built parameter block, into `out`.
+//
+// ```novo
+// use std.bytes
+// use b2param
+// use b2bytes
+//
+// fn main() [io]
+//     let p = b2param.with_personal(b2param.sequential(32), 7, 0)
+//     match b2bytes.blake2s_full_into(p, bytes.zeros(0), bytes.from_str("abc"), bytes.zeros(32))
+//         Ok(d) => println("${bytes.len(d)}")              // 32
+//         Err(_) => println("refused")
+// ```
+pub fn blake2s_full_into(p: B2Params, key: Bytes, msg: Bytes,
+                         out: Bytes) -> Result<Bytes, B2Error> []
+    todo("blake2-nv.b2bytes.blake2s_full_into")

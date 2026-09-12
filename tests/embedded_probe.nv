@@ -1,0 +1,199 @@
+// embedded_probe.nv — this package's device claim, as a program that
+// either builds for a Cortex-M or does not.
+//
+// It is not a test.  `scripts/shard_audit.sh`'s `core-embedded` row
+// copies it and the modules it names into a package of its own and
+// runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a real Cortex-M4 ELF or fails.
+//
+// WHAT THE CLAIM COVERS: `b2param`, `blake2b`, `blake2s` and `b2err` —
+// which between them are a WHOLE hash, not a fragment of one.  A
+// firmware calls `init`, `feed_byte` in a loop and `finish`, then
+// compares `digest_byte`; the arena is untouched from start to end.
+//
+// The device this is for is real and named in the plan: a bootloader
+// that verifies an image in flash before it jumps to it, and a BLE
+// peripheral that wants a MAC and has no AES instructions.  Both hold
+// a key in flash and read the message a byte at a time out of a
+// memory-mapped region.  Neither has a heap, and neither can afford
+// one.
+//
+// WHY A BYTE AT A TIME IS THE RIGHT INTERFACE FOR THEM.  A `Bytes`
+// chunk is a heap object; a byte is a register.  BLAKE2's state
+// already holds its own 128-byte block as sixteen inline words, so
+// feeding a byte costs one masked store and a branch on a length —
+// and the whole streaming rule, including the lazy compression that
+// makes the last block the last block, is inside `feed_byte`.
+//
+// WHAT IS NOT CLAIMED.  `b2bytes` speaks `Bytes`, which is a heap
+// object; it is the host's half and the README says so.  A device that
+// wants a keyed hash keys it itself: `b2param.keyed` sets the length
+// and the key's zero-padded block goes in through `with_block_byte`
+// and `compress`, which is exactly what `b2bytes.init_keyed_b` does
+// one module up.
+//
+// WHAT THE TIER ACTUALLY CHECKS AT 0.0.1 is narrower than it will be.
+// Every body under `src/` is a `todo()`, so what links today is the
+// SIGNATURES and the types — `Int` in and out, `@value` structs with
+// inline arrays, and no allocator anywhere in the shape.  There is no
+// arithmetic in the binary yet, so this probe does not prove the
+// compression function is allocation-free; it proves that nothing in
+// the shape of the surface needs an allocator or a host.  Keeping it
+// green once the bodies land is a named cost of the implementation
+// step.
+
+use b2param
+use blake2b
+use blake2s
+
+// A key as a device holds it: words written into flash by a
+// provisioning step, never a `Bytes`.
+const KEY_WORD_0: Int = 0x03020100
+const KEY_WORD_7: Int = 0x1f1e1d1c
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.  A firmware image has one line of
+// output; making it depend on all of them is what stops a passing run
+// from meaning "the first call linked".
+@tier(embedded)
+fn score() -> Int
+    var n = 0
+
+    // ── The parameter block, built out of registers ──────────────
+    let p = b2param.sequential(32)
+    if b2param.digest_length(p) == 32
+        n = n + 1
+    if b2param.fanout(p) == 1
+        n = n + 1
+    if b2param.is_sequential(p)
+        n = n + 1
+    let kp = b2param.with_personal(b2param.keyed(64, 64), KEY_WORD_0, KEY_WORD_7)
+    if b2param.key_length(kp) == 64
+        n = n + 1
+    if b2param.personal_lo(kp) == KEY_WORD_0
+        n = n + 1
+    // The two serialisations, which is what makes one parameter type
+    // serve two algorithms.
+    if b2param.b_word(p, 1) == 0
+        n = n + 1
+    if b2param.s_word(p, 1) == 0
+        n = n + 1
+
+    // ── BLAKE2b, whole ──────────────────────────────────────────
+    var b = blake2b.init(p)
+    if blake2b.digest_length(b) == 32
+        n = n + 1
+    if blake2b.counter_low(b) == 0
+        n = n + 1
+    // A byte at a time, which is how a bootloader reads flash.
+    b = blake2b.feed_byte(b, 0x61)
+    b = blake2b.feed_byte(b, 0x62)
+    b = blake2b.feed_byte(b, 0x63)
+    if blake2b.buffered(b) == 3
+        n = n + 1
+    if blake2b.block_byte(b, 0) == 0x61
+        n = n + 1
+    let bf = blake2b.finish(b)
+    if blake2b.is_last(bf)
+        n = n + 1
+    if blake2b.digest_byte(bf, 0) >= 0
+        n = n + 1
+    // The pieces a caller driving the compression itself needs.
+    let bw = blake2b.round(blake2b.work(b), b, 0)
+    if blake2b.work_word(bw, 0) != 0
+        n = n + 1
+    if blake2b.work_word(blake2b.g(blake2b.work(b), 0, 4, 8, 12, 0, 0), 0) != 0
+        n = n + 1
+    if blake2b.state_word(blake2b.compress(blake2b.add_counter(b, 3)), 0) != 0
+        n = n + 1
+    if blake2b.rotation(3) == 63
+        n = n + 1
+    if blake2b.sigma(0, 0) == 0
+        n = n + 1
+    if blake2b.rotr(blake2b.iv(0), 1) != 0
+        n = n + 1
+    // Filling the block by words and zeroing the tail, which is what a
+    // device that has the message in a register file does.
+    let bz = blake2b.zero_tail(blake2b.with_buffered(
+        blake2b.with_block_word(blake2b.zero_state(), 0, KEY_WORD_0), 8))
+    if blake2b.block_word(bz, 15) == 0
+        n = n + 1
+    if blake2b.is_last_node(blake2b.mark_last_node(bz))
+        n = n + 1
+    if blake2b.counter_high(blake2b.with_counter(bz, 0, 1)) == 1
+        n = n + 1
+    if blake2b.state_word(blake2b.with_state_word(bz, 0, 7), 0) == 7
+        n = n + 1
+    if blake2b.work_word(blake2b.with_work_word(blake2b.work(bz), 0, 9), 0) == 9
+        n = n + 1
+    if blake2b.block_byte(blake2b.with_block_byte(bz, 0, 0x41), 0) == 0x41
+        n = n + 1
+    if blake2b.is_last(blake2b.mark_last(bz))
+        n = n + 1
+
+    // ── BLAKE2s, whole, at the other word width ─────────────────
+    var s = blake2s.init(p)
+    if blake2s.digest_length(s) == 32
+        n = n + 1
+    s = blake2s.feed_byte(s, 0x61)
+    if blake2s.buffered(s) == 1
+        n = n + 1
+    if blake2s.block_byte(s, 0) == 0x61
+        n = n + 1
+    let sf = blake2s.finish(s)
+    if blake2s.is_last(sf)
+        n = n + 1
+    if blake2s.digest_byte(sf, 0) >= 0
+        n = n + 1
+    if blake2s.rotation(3) == 7
+        n = n + 1
+    if blake2s.sigma(0, 0) == 0
+        n = n + 1
+    if blake2s.mask(blake2s.iv(0)) == blake2s.iv(0)
+        n = n + 1
+    if blake2s.rotr(1, 1) != 0
+        n = n + 1
+    if blake2s.work_word(blake2s.round(blake2s.work(s), s, 0), 0) != 0
+        n = n + 1
+    if blake2s.work_word(blake2s.g(blake2s.work(s), 0, 4, 8, 12, 0, 0), 0) != 0
+        n = n + 1
+    if blake2s.state_word(blake2s.compress(blake2s.add_counter(s, 1)), 0) != 0
+        n = n + 1
+    let sz = blake2s.zero_tail(blake2s.with_buffered(
+        blake2s.with_block_word(blake2s.zero_state(), 0, KEY_WORD_0), 4))
+    if blake2s.block_word(sz, 15) == 0
+        n = n + 1
+    if blake2s.counter_low(sz) == 0
+        n = n + 1
+    if blake2s.counter_high(blake2s.with_counter(sz, 0, 1)) == 1
+        n = n + 1
+    if blake2s.state_word(blake2s.with_state_word(sz, 0, 7), 0) == 7
+        n = n + 1
+    if blake2s.work_word(blake2s.with_work_word(blake2s.work(sz), 0, 9), 0) == 9
+        n = n + 1
+    if blake2s.block_byte(blake2s.with_block_byte(sz, 0, 0x41), 0) == 0x41
+        n = n + 1
+    if blake2s.is_last_node(blake2s.mark_last_node(sz))
+        n = n + 1
+    if blake2s.is_last(blake2s.mark_last(sz))
+        n = n + 1
+
+    n
+
+@tier(rt)
+fn main() [hw, time]
+    bsp.board.init()
+    // 46 is the number of checks in `score` on the path a linked build
+    // takes.  The count is printed on a failure rather than only
+    // compared, so a device that disagrees with the host says HOW MANY
+    // it lost and a bisect has somewhere to start.
+    let n = score()
+    if n == 46
+        hal.uart.write("PASS: blake2-embedded\n")
+    else
+        hal.uart.write("FAIL: blake2-embedded\n")
+    loop
+        core.rt.sleep_ms(1000)

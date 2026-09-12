@@ -1,0 +1,381 @@
+// b2param.nv — the parameter block, as a value.  This is the
+// load-bearing interface of the package.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THIS MODULE IS WHY THE PACKAGE HAS FIVE INITIALISERS AND NOT
+// TWENTY.  RFC 7693 § 2.8 says the initial chaining value is the IV
+// XOR the parameter block, and the parameter block holds the digest
+// length, the key length, the fanout, the depth, the leaf length, the
+// node offset, the node depth, the inner length, the salt and the
+// personalisation.  So plain, keyed, salted, personalised and tree
+// BLAKE2 are not five constructions: they are ONE construction over
+// five parameter blocks.  A package that published `blake2b`,
+// `blake2b_keyed`, `blake2b_salted`, `blake2b_keyed_salted` … would be
+// publishing the cartesian product of a struct, and a caller wanting
+// the combination nobody enumerated would be stuck.
+//
+// TWO CONSEQUENCES A PORT USUALLY GETS WRONG, and both are properties
+// of this module rather than of the compression function:
+//
+//   * BLAKE2b-256 IS NOT BLAKE2b-512 TRUNCATED.  The digest length is
+//     byte 0 of the parameter block, so it is XORed into h[0] before
+//     the first byte of message is seen.  Two digests of different
+//     lengths over the same input share no prefix at all.  A port that
+//     hashes at 64 and truncates passes every 64-byte vector and
+//     disagrees with the world everywhere else.
+//   * THE KEY LENGTH IS IN THE PARAMETER BLOCK, AND THE KEY IS ALSO A
+//     MESSAGE BLOCK.  § 3.3: a keyed hash puts the key, zero-padded to
+//     a full block, in FRONT of the message — so a keyed hash of the
+//     empty message still compresses once, and a port that only sets
+//     `key_length` produces a number nothing else computes.  Both
+//     halves are here: `keyed` sets the field, `b2bytes.init_keyed_b`
+//     feeds the block.
+//
+// WHY THE FIELDS ARE `Int`S AND NOT BYTES.  A parameter block is 64
+// bytes for BLAKE2b and 32 for BLAKE2s, and the two lay the SAME
+// logical fields out at different widths — `node_offset` is eight
+// bytes in one and six in the other, the salt sixteen and eight.
+// Keeping the logical fields here and doing the serialisation in
+// `b_word` and `s_word` is what lets one type serve both, and it is
+// what lets a caller read back what they set instead of a byte offset.
+//
+// THE SALT AND THE PERSONALISATION ARE TWO `Int`S EACH, low half then
+// high half, little-endian, because that is exactly BLAKE2b's sixteen
+// bytes and BLAKE2s uses the low one and ignores the high.  No inline
+// array, no `Bytes`: this module is in the device claim, and a device
+// that personalises a hash has the sixteen bytes in two registers.
+
+// ── The widths, per algorithm ────────────────────────────────────────
+
+// BLAKE2b's longest digest: 64 bytes.
+pub const B2B_OUT_BYTES_MOST = 64
+
+// BLAKE2s's longest digest: 32 bytes.
+pub const B2S_OUT_BYTES_MOST = 32
+
+// The shortest digest either algorithm admits: one byte.  Zero is
+// refused — see `B2DigestLengthOutOfRange`.
+pub const B2_OUT_BYTES_LEAST = 1
+
+// BLAKE2b's longest key: 64 bytes.
+pub const B2B_KEY_BYTES_MOST = 64
+
+// BLAKE2s's longest key: 32 bytes.
+pub const B2S_KEY_BYTES_MOST = 32
+
+// BLAKE2b's salt: 16 bytes, exactly, when there is one.
+pub const B2B_SALT_BYTES = 16
+
+// BLAKE2s's salt: 8 bytes, exactly, when there is one.
+pub const B2S_SALT_BYTES = 8
+
+// BLAKE2b's personalisation: 16 bytes, exactly, when there is one.
+pub const B2B_PERSONAL_BYTES = 16
+
+// BLAKE2s's personalisation: 8 bytes, exactly, when there is one.
+pub const B2S_PERSONAL_BYTES = 8
+
+// BLAKE2b's parameter block: 64 bytes, which is eight 64-bit words.
+pub const B2B_PARAM_WORDS = 8
+
+// BLAKE2s's parameter block: 32 bytes, which is eight 32-bit words.
+pub const B2S_PARAM_WORDS = 8
+
+// ── The parameter block ──────────────────────────────────────────────
+
+// RFC 7693 § 2.8's parameter block, as its logical fields.
+//
+// A `@value` struct of twelve `Int`s, so it lives in the caller's
+// frame — no cell, no header, no reference count — and a device sets
+// one up out of flash constants.
+//
+// ```novo
+// use b2param
+//
+// fn main() [io]
+//     let p = b2param.sequential(32)
+//     println("${b2param.digest_length(p)}")          // 32
+// ```
+pub @value
+struct B2Params
+    // Bytes of digest this state will produce: 1 ..= 64 for BLAKE2b,
+    // 1 ..= 32 for BLAKE2s.  Byte 0 of the block.
+    digest_length: Int
+    // Bytes of key: 0 for unkeyed.  Byte 1.
+    key_length: Int
+    // The tree fanout: 1 for sequential, 0 for unlimited.  Byte 2.
+    fanout: Int
+    // The maximum tree depth: 1 for sequential, 0 for unlimited.
+    // Byte 3.
+    depth: Int
+    // The leaf length in bytes: 0 for sequential.  Bytes 4..7.
+    leaf_length: Int
+    // The node offset: 0 for sequential.  Eight bytes in BLAKE2b's
+    // block, six in BLAKE2s's.
+    node_offset: Int
+    // The node depth: 0 for a leaf and for sequential.
+    node_depth: Int
+    // The inner hash length: 0 for sequential.
+    inner_length: Int
+    // The salt's low eight bytes, little-endian.  BLAKE2s's whole
+    // salt; BLAKE2b's first half.
+    salt_lo: Int
+    // The salt's high eight bytes, little-endian.  BLAKE2b only;
+    // ignored by `s_word`.
+    salt_hi: Int
+    // The personalisation's low eight bytes, little-endian.
+    personal_lo: Int
+    // The personalisation's high eight bytes, little-endian.  BLAKE2b
+    // only.
+    personal_hi: Int
+
+// ── Building one ─────────────────────────────────────────────────────
+
+// The sequential unkeyed parameter block: this digest length, fanout
+// 1, depth 1, and every other field zero.
+//
+// The one almost every caller wants, and the one RFC 7693 § 2.5's own
+// vectors are computed with.
+//
+// ```novo
+// use b2param
+//
+// fn main() [io]
+//     println("${b2param.fanout(b2param.sequential(64))}")     // 1
+// ```
+pub fn sequential(digest_length: Int) -> B2Params []
+    todo("blake2-nv.b2param.sequential")
+
+// The sequential KEYED parameter block: this digest length, this key
+// length, fanout 1, depth 1.
+//
+// `keyed(n, 0)` is `sequential(n)`, byte for byte.  That is not an
+// accident to be tidied away — it is why a caller can pass an
+// optionally-present key through one code path.
+//
+// Setting `key_length` is HALF of keying.  The other half is feeding
+// the zero-padded key as the first message block, which is
+// `b2bytes.init_keyed_b` and `b2bytes.init_keyed_s`; this function on
+// its own produces a state that is not any published BLAKE2.
+//
+// ```novo
+// use b2param
+//
+// fn main() [io]
+//     println("${b2param.key_length(b2param.keyed(32, 32))}")  // 32
+// ```
+pub fn keyed(digest_length: Int, key_length: Int) -> B2Params []
+    todo("blake2-nv.b2param.keyed")
+
+// The same block with a salt.
+//
+// The salt is sixteen bytes for BLAKE2b as two little-endian halves,
+// and eight for BLAKE2s as `lo` alone with `hi` ignored.  A caller who
+// has the salt as `Bytes` uses `b2bytes.word_le` to read each half
+// and `b2bytes.check_salt_b` to refuse a wrong width first.
+//
+// ```novo
+// use b2param
+//
+// fn main() [io]
+//     let p = b2param.with_salt(b2param.sequential(32), 1, 2)
+//     println("${b2param.salt_hi(p)}")                         // 2
+// ```
+pub fn with_salt(p: B2Params, lo: Int, hi: Int) -> B2Params []
+    todo("blake2-nv.b2param.with_salt")
+
+// The same block with a personalisation.
+//
+// Personalisation is the field that makes two protocols using the same
+// key compute different MACs — PASERK's identifiers and libsodium's
+// `crypto_generichash` both use it — and it is the reason a domain
+// separator does not have to be prepended to the message.
+//
+// ```novo
+// use b2param
+//
+// fn main() [io]
+//     let p = b2param.with_personal(b2param.sequential(32), 7, 0)
+//     println("${b2param.personal_lo(p)}")                     // 7
+// ```
+pub fn with_personal(p: B2Params, lo: Int, hi: Int) -> B2Params []
+    todo("blake2-nv.b2param.with_personal")
+
+// The same block with the tree parameters set.
+//
+// Published because the parameter block IS the tree format and a
+// caller building BLAKE2bp, BLAKE2sp or a Merkle mode needs to write
+// the fields; NOT driven by this package's one-shots, which refuse a
+// non-sequential block with `B2TreeModeNotDriven` rather than hashing
+// one leaf and calling it the answer.  The README says what a tree
+// caller has to supply on top of this.
+//
+// ```novo
+// use b2param
+//
+// fn main() [io]
+//     let p = b2param.with_tree(b2param.sequential(64), 4, 2, 4096, 0, 0, 64)
+//     println("${b2param.depth(p)}")                           // 2
+// ```
+pub fn with_tree(p: B2Params, fanout: Int, depth: Int, leaf_length: Int, node_offset: Int,
+                 node_depth: Int, inner_length: Int) -> B2Params []
+    todo("blake2-nv.b2param.with_tree")
+
+// The same block with a different digest length.
+//
+// A separate function rather than a field write, because changing the
+// digest length changes the initial chaining value and so invalidates
+// any state already built from this block.  Calling it is a decision;
+// `blake2b.init` is where it takes effect.
+//
+// ```novo
+// use b2param
+//
+// fn main() [io]
+//     println("${b2param.digest_length(b2param.with_digest_length(b2param.sequential(64), 33))}")
+// ```
+pub fn with_digest_length(p: B2Params, digest_length: Int) -> B2Params []
+    todo("blake2-nv.b2param.with_digest_length")
+
+// ── Reading one back ─────────────────────────────────────────────────
+
+// Bytes of digest this block asks for.
+pub fn digest_length(p: B2Params) -> Int []
+    todo("blake2-nv.b2param.digest_length")
+
+// Bytes of key this block declares.  Zero is unkeyed.
+pub fn key_length(p: B2Params) -> Int []
+    todo("blake2-nv.b2param.key_length")
+
+// The tree fanout.  One is sequential.
+pub fn fanout(p: B2Params) -> Int []
+    todo("blake2-nv.b2param.fanout")
+
+// The maximum tree depth.  One is sequential.
+pub fn depth(p: B2Params) -> Int []
+    todo("blake2-nv.b2param.depth")
+
+// The leaf length in bytes.  Zero is sequential.
+pub fn leaf_length(p: B2Params) -> Int []
+    todo("blake2-nv.b2param.leaf_length")
+
+// The node offset.
+pub fn node_offset(p: B2Params) -> Int []
+    todo("blake2-nv.b2param.node_offset")
+
+// The node depth.  Zero is a leaf, and sequential.
+pub fn node_depth(p: B2Params) -> Int []
+    todo("blake2-nv.b2param.node_depth")
+
+// The inner hash length.  Zero is sequential.
+pub fn inner_length(p: B2Params) -> Int []
+    todo("blake2-nv.b2param.inner_length")
+
+// The salt's low eight bytes as a little-endian word.
+pub fn salt_lo(p: B2Params) -> Int []
+    todo("blake2-nv.b2param.salt_lo")
+
+// The salt's high eight bytes as a little-endian word.  BLAKE2b only.
+pub fn salt_hi(p: B2Params) -> Int []
+    todo("blake2-nv.b2param.salt_hi")
+
+// The personalisation's low eight bytes as a little-endian word.
+pub fn personal_lo(p: B2Params) -> Int []
+    todo("blake2-nv.b2param.personal_lo")
+
+// The personalisation's high eight bytes as a little-endian word.
+// BLAKE2b only.
+pub fn personal_hi(p: B2Params) -> Int []
+    todo("blake2-nv.b2param.personal_hi")
+
+// Whether this block is the sequential mode: fanout 1, depth 1, and
+// the four tree fields zero.
+//
+// The predicate `b2bytes`'s one-shots test before they drive a state.
+//
+// ```novo
+// use b2param
+//
+// fn main() [io]
+//     println("${b2param.is_sequential(b2param.sequential(32))}")   // true
+// ```
+pub fn is_sequential(p: B2Params) -> Bool []
+    todo("blake2-nv.b2param.is_sequential")
+
+// ── Serialising one ──────────────────────────────────────────────────
+
+// Word `i` of BLAKE2b's 64-byte parameter block, little-endian, for
+// `i` in 0 ..= 7.
+//
+// Word 0 packs `digest_length`, `key_length`, `fanout` and `depth`
+// into its low four bytes and `leaf_length` into its high four; word 1
+// is `node_offset`; word 2's low two bytes are `node_depth` and
+// `inner_length` and its remaining fourteen are the reserved zeros;
+// words 4..5 are the salt and words 6..7 the personalisation.
+//
+// Public because it is the value a reader checks against the reference
+// implementation's `blake2b_param` struct when a digest disagrees, and
+// because a tree caller writing their own initialiser needs it.
+//
+// ```novo
+// use b2param
+//
+// fn main() [io]
+//     println("${b2param.b_word(b2param.sequential(64), 1)}")       // 0
+// ```
+pub fn b_word(p: B2Params, i: Int) -> Int []
+    todo("blake2-nv.b2param.b_word")
+
+// Word `i` of BLAKE2s's 32-byte parameter block, little-endian and
+// masked to 32 bits, for `i` in 0 ..= 7.
+//
+// The layout differs from BLAKE2b's and this is the module that knows
+// how: `node_offset` is SIX bytes here, spilling from word 2 into the
+// low half of word 3, and the salt and personalisation are two words
+// each rather than four.  A port that reuses BLAKE2b's packing for
+// BLAKE2s produces states that pass no vector.
+//
+// ```novo
+// use b2param
+//
+// fn main() [io]
+//     println("${b2param.s_word(b2param.sequential(32), 1)}")       // 0
+// ```
+pub fn s_word(p: B2Params, i: Int) -> Int []
+    todo("blake2-nv.b2param.s_word")
+
+// ── Checking one ─────────────────────────────────────────────────────
+
+// Whether this block is a legal BLAKE2b one: the digest length in
+// 1 ..= 64, the key length in 0 ..= 64.
+//
+// Answers `?B2Error` rather than refusing in a constructor, because
+// `B2Params` is a `@value` and an unboxed struct may not be a `Result`
+// payload.  Call it before `blake2b.init`.
+//
+// ```novo
+// use b2param
+//
+// fn main() [io]
+//     match b2param.check_b(b2param.sequential(65))
+//         Some(_) => println("refused")
+//         None => println("ok")
+// ```
+pub fn check_b(p: B2Params) -> ?B2Error []
+    todo("blake2-nv.b2param.check_b")
+
+// Whether this block is a legal BLAKE2s one: the digest length in
+// 1 ..= 32, the key length in 0 ..= 32.
+//
+// ```novo
+// use b2param
+//
+// fn main() [io]
+//     match b2param.check_s(b2param.sequential(32))
+//         Some(_) => println("refused")
+//         None => println("ok")
+// ```
+pub fn check_s(p: B2Params) -> ?B2Error []
+    todo("blake2-nv.b2param.check_s")
