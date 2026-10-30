@@ -1,0 +1,914 @@
+// blake2b.nv — BLAKE2b's state and its compression function, in word
+// algebra with no `Bytes` and no `Str` anywhere in the module.
+//
+// This is the half that runs on a device, and it is a whole hash
+// rather than a fragment of one: `init`, `feed_byte`, `finish` and
+// `digest_byte` are a complete BLAKE2b with no allocator behind them.
+// A bootloader verifying an image in flash reads a byte, feeds it, and
+// compares sixteen bytes at the end; the arena is untouched and the
+// state is 240 bytes of its own stack frame.  The `Bytes` half is
+// `b2bytes`, one module up, and the split is crypto-nv's —
+// `sha512_core` beside `hashing`, for the same reason and with the
+// same shape.
+//
+// Words are `Int`, and BLAKE2b's are 64 bits wide, which is this
+// language's whole `Int`.  Every bit pattern fits, so there is no mask
+// step the way BLAKE2s needs one; what there IS is wrapping, because
+// the algorithm is defined modulo 2^64 and `Int` traps on overflow
+// (SPEC § 13.2).  Every addition below is `int.wrapping_add` and every
+// value this module answers is the reference implementation's bit
+// pattern reinterpreted as signed — `b2bytes` is where it becomes
+// bytes again, and a caller printing one wants an unsigned rendering.
+//
+// The buffer is inside the state, as sixteen words, and that is the
+// decision the device claim rests on.  A hasher that kept its partial
+// block in a `Bytes` would be a heap object, could not be a `@value`,
+// and could not be held by a firmware at all.  Sixteen inline words is
+// 128 bytes of the caller's frame and the same 128 bytes the algorithm
+// compresses.
+//
+// BLAKE2 buffers lazily, and a port that does not is wrong on exactly
+// one input in 128.  The last block is compressed with the
+// finalisation flag set, so the implementation may never compress a
+// full buffer just because it is full — it has to wait until another
+// byte arrives and prove the block was not the last.  `feed_byte` is
+// that rule: it compresses the block it is HOLDING before it stores
+// the byte it was HANDED, never after.
+//
+// What is constant time here, in one sentence each, because a crypto
+// package that does not say is a crypto package a reviewer cannot use:
+//
+//   * `g`, `round` and `compress` are constant time by construction —
+//     addition, XOR and rotation by a CONSTANT amount, no branch on a
+//     key bit, no table lookup indexed by data.  `sigma` is indexed by
+//     the round number and the lane, both of which are loop counters.
+//   * `feed_byte` branches on `buffered`, which is a message LENGTH.
+//     Message lengths are not secret in any construction this package
+//     is used by, and both of them — Argon2's H and PASETO's MAC — fix
+//     the length in advance.
+//   * `state_word`, `block_word`, `block_byte` and `digest_byte` index
+//     an inline array with an index the CALLER chose.  They are
+//     constant time with respect to the key; they are not constant
+//     time with respect to `i`, and nothing here passes a secret as
+//     `i`.
+//   * Nothing in this module compares anything.  A MAC comparison is
+//     crypto-nv's `digest.ct_eq`, and the README says to take it from
+//     there rather than writing a second one.
+
+use std.int
+use b2param
+
+// ── Sizes ────────────────────────────────────────────────────────────
+
+// The chaining value, in 64-bit words: eight, which is 512 bits.
+pub const B2B_STATE_WORDS = 8
+
+// The message block, in 64-bit words: sixteen.
+pub const B2B_BLOCK_WORDS = 16
+
+// The message block, in bytes: one hundred and twenty-eight.
+pub const B2B_BLOCK_BYTES = 128
+
+// The working vector the compression function mixes, in words:
+// sixteen — the eight chaining words and the eight IV words.
+pub const B2B_WORK_WORDS = 16
+
+// The rounds: twelve.  RFC 7693 § 2.5 fixes it, and a package that
+// offered fewer would be offering a caller a choice they have no way
+// to make.
+pub const B2B_ROUNDS = 12
+
+// The digest, at its longest: 64 bytes.  The same number as
+// `b2param.B2B_OUT_BYTES_MOST`, repeated here so a caller sizing a
+// buffer at the state's own module does not have to reach for another.
+pub const B2B_DIGEST_BYTES_MOST = 64
+
+// ── The two values ───────────────────────────────────────────────────
+
+// A BLAKE2b hash in flight: the chaining value, the block being
+// filled, the byte counter, the two finalisation flags, and the digest
+// length the parameter block asked for.
+//
+// A `@value` struct, so all of it lives in the caller's frame — no
+// cell, no header, no reference count — and `[Int; 8]` and `[Int; 16]`
+// inside one are true inline arrays (SPEC § 14.4).  Two hundred and
+// forty bytes of stack is what a device spends to hold a BLAKE2b in
+// flight, and there is nothing else to spend.
+//
+// ```novo
+// use b2param
+// use blake2b
+//
+// fn main() [io]
+//     let st = blake2b.init(b2param.sequential(32))
+//     println("${blake2b.digest_length(st)}")      // 32
+// ```
+pub @value
+struct B2bState
+    // The chaining value h[0..7], as RFC 7693 § 2.6 names it.
+    h: [Int; 8]
+    // The message block being filled, as sixteen little-endian words:
+    // byte `j` of the block is bits `8*(j mod 8)` of word `j / 8`.
+    m: [Int; 16]
+    // The low half of the 128-bit byte counter `t`.
+    t0: Int
+    // The high half of the 128-bit byte counter `t`.
+    t1: Int
+    // The finalisation flag `f0`: all ones on the last block, zero
+    // before it.
+    f0: Int
+    // The last-node flag `f1`: all ones on the last node of a tree's
+    // last layer, zero in sequential mode.
+    f1: Int
+    // Bytes of `m` that hold message: 0 ..= 128.
+    buffered: Int
+    // Bytes of digest this state will produce, copied out of the
+    // parameter block so `finish` and `digest_byte` need no second
+    // argument.
+    outlen: Int
+
+// The sixteen-word working vector one compression mixes.
+//
+// Its own type rather than a second `B2bState`, because the two are
+// the same shape and mean opposite things — one is a hash a caller may
+// still feed, the other is scratch that is dead the moment the
+// feed-forward has run — and a program that mixed them up would
+// produce a chaining value out of a half-mixed vector and never
+// notice.
+//
+// ```novo
+// use b2param
+// use blake2b
+//
+// fn main() [io]
+//     let w = blake2b.work(blake2b.init(b2param.sequential(64)))
+//     println("${blake2b.work_word(w, 8)}")        // the first IV word
+// ```
+pub @value
+struct B2bWork
+    // v[0..15]: the chaining value, then the IV with `t` and `f`
+    // folded in.
+    v: [Int; 16]
+
+// ── Constants ────────────────────────────────────────────────────────
+
+// IV word `i`, for `i` in 0 ..= 7: SHA-512's initial value, which is
+// the fractional parts of the square roots of the first eight primes.
+// Zero outside that range.
+//
+// Public because it is what a reader checks first when a digest
+// disagrees, and because a caller writing their own tree initialiser
+// needs it.  Not taken from crypto-nv: eight numbers are not worth a
+// dependency in a device's link graph.
+//
+// Five of the eight have the high bit set, and `Int` is signed, so
+// they cannot be written as hex literals — 0xBB67AE8584CAA73B is
+// -4942790177534073029 spelled the way the source has to spell it.
+// crypto-nv's `sha512_core.new` writes the same five the same way.
+// The hex stays in a comment beside each; the tests compare against
+// the decimals.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.iv(0)}")                  // 7640891576956012808
+// ```
+pub @tier(embedded)
+fn iv(i: Int) -> Int []
+    if i == 0
+        7640891576956012808   // 0x6a09e667f3bcc908
+    else if i == 1
+        -4942790177534073029   // 0xbb67ae8584caa73b
+    else if i == 2
+        4354685564936845355   // 0x3c6ef372fe94f82b
+    else if i == 3
+        -6534734903238641935   // 0xa54ff53a5f1d36f1
+    else if i == 4
+        5840696475078001361   // 0x510e527fade682d1
+    else if i == 5
+        -7276294671716946913   // 0x9b05688c2b3e6c1f
+    else if i == 6
+        2270897969802886507   // 0x1f83d9abfb41bd6b
+    else if i == 7
+        6620516959819538809   // 0x5be0cd19137e2179
+    else
+        0
+
+// One row of the permutation table, sixteen 4-bit indices packed into
+// one word with entry 0 in the lowest nibble.
+@tier(embedded)
+fn sigma_row(r: Int) -> Int
+    if r == 0
+        -81985529216486896   // 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+    else if r == 1
+        3853709921291437230   // 14 10 4 8 9 15 13 6 1 12 0 2 11 7 5 3
+    else if r == 2
+        5266788149650328715   // 11 8 12 0 5 2 15 13 10 14 3 6 7 1 9 4
+    else if r == 3
+        -8141200382097550441   // 7 9 3 1 13 12 11 14 2 6 5 10 4 0 15 8
+    else if r == 4
+        -3204650750919412471   // 9 0 5 7 2 4 10 15 14 1 11 12 6 8 3 13
+    else if r == 5
+        -7931023849780369726   // 2 12 6 10 0 11 8 3 4 13 7 5 15 14 1 9
+    else if r == 6
+        -5176546439255363236   // 12 5 1 15 14 13 4 10 0 7 6 3 9 2 8 11
+    else if r == 7
+        -6744053556625741891   // 13 11 7 14 12 1 3 9 5 0 15 4 8 6 2 10
+    else if r == 8
+        6503616966983130870   // 6 15 14 9 11 3 0 8 12 2 13 7 1 4 10 5
+    else
+        991893350865389610   // 10 2 8 4 7 6 1 5 15 11 9 14 3 12 13 0
+
+// The message-word permutation: σ[r][i], for `r` in 0 ..= 11 and `i`
+// in 0 ..= 15 (RFC 7693 § 2.7); zero outside that range.
+//
+// Twelve rounds over a table of ten rows: rounds 10 and 11 reuse rows
+// 0 and 1, which is the one line of the specification a port skips
+// most often and the reason BLAKE2b and BLAKE2s share a table.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.sigma(1, 0)}")            // 14
+// ```
+pub @tier(embedded)
+fn sigma(r: Int, i: Int) -> Int []
+    if r < 0 or r >= B2B_ROUNDS or i < 0 or i > 15
+        0
+    else
+        (sigma_row(r % 10) >>> (4 * i)) & 0xF
+
+// Rotation amount `i`, for `i` in 0 ..= 3: 32, 24, 16, 63 (§ 2.1's
+// R1..R4); zero outside that range.
+//
+// BLAKE2s's are 16, 12, 8, 7, and that difference is the whole of what
+// makes the two algorithms two algorithms rather than one at two
+// widths.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.rotation(1)}")            // 24
+// ```
+pub @tier(embedded)
+fn rotation(i: Int) -> Int []
+    if i == 0
+        32
+    else if i == 1
+        24
+    else if i == 2
+        16
+    else if i == 3
+        63
+    else
+        0
+
+// `x` rotated right by `n` bits, over 64.  `n` is taken modulo 64.
+//
+// Public because it is the operation a reader disassembling a
+// disagreement wants to call directly, and because there is no
+// standard-library rotate that is 64-bit by definition rather than by
+// the platform.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.rotr(1, 1)}")             // -9223372036854775808
+// ```
+pub @tier(embedded)
+fn rotr(x: Int, n: Int) -> Int []
+    let k = n & 63
+    if k == 0
+        x
+    else
+        (x >>> k) | (x << (64 - k))
+
+// ── Building and reading a state ─────────────────────────────────────
+
+// A state with every word zero.
+//
+// Not a usable hash — `init` is — but the value a device builds a
+// state out of when it sets words itself, and the one the tests
+// compare a fresh state against.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.counter_low(blake2b.zero_state())}")   // 0
+// ```
+pub @tier(embedded)
+fn zero_state() -> B2bState []
+    B2bState { h: [0, 0, 0, 0, 0, 0, 0, 0],
+               m: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               t0: 0, t1: 0, f0: 0, f1: 0, buffered: 0, outlen: 0 }
+
+// The state RFC 7693 § 2.6 starts from: h[i] = IV[i] XOR the
+// parameter block's word `i`, the counter zero, both flags clear.
+//
+// This is where the digest length takes effect, which is why
+// BLAKE2b-256 is not BLAKE2b-512 truncated: `digest_length` is byte 0
+// of `b2param.b_word(p, 0)` and is XORed into h[0] before a byte of
+// message is seen.
+//
+// It does NOT feed a key.  A keyed hash's first message block is the
+// zero-padded key, which needs a `Bytes` and so lives in
+// `b2bytes.init_keyed_b`; a device with the key in words calls this
+// and then fills the block itself.
+//
+// ```novo
+// use b2param
+// use blake2b
+//
+// fn main() [io]
+//     let st = blake2b.init(b2param.sequential(64))
+//     println("${blake2b.state_word(st, 0)}")
+// ```
+pub @tier(embedded)
+fn init(p: B2Params) -> B2bState []
+    var st = zero_state()
+    for i in 0..8
+        st.set_h(i, iv(i) ^ b2param.b_word(p, i))
+    st.set_outlen(p.digest_length)
+    st
+
+// Chaining word `i`, for `i` in 0 ..= 7; zero outside that range.
+//
+// ```novo
+// use b2param
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.state_word(blake2b.init(b2param.sequential(64)), 1)}")
+// ```
+pub @tier(embedded)
+fn state_word(st: B2bState, i: Int) -> Int []
+    if i < 0 or i >= B2B_STATE_WORDS
+        0
+    else
+        st.h[i]
+
+// The same state with chaining word `i` set.
+//
+// For a caller resuming a hash from a checkpoint they stored, and for
+// a tree mode that keys a node from another node's output.  An index
+// outside 0 ..= 7 returns the state unchanged.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     let st = blake2b.with_state_word(blake2b.zero_state(), 3, 9)
+//     println("${blake2b.state_word(st, 3)}")      // 9
+// ```
+pub @tier(embedded)
+fn with_state_word(st: B2bState, i: Int, v: Int) -> B2bState []
+    if i < 0 or i >= B2B_STATE_WORDS
+        st
+    else
+        var r = st
+        r.set_h(i, v)
+        r
+
+// Message word `i` of the block being filled, for `i` in 0 ..= 15;
+// zero outside that range.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.block_word(blake2b.zero_state(), 0)}")   // 0
+// ```
+pub @tier(embedded)
+fn block_word(st: B2bState, i: Int) -> Int []
+    if i < 0 or i >= B2B_BLOCK_WORDS
+        0
+    else
+        st.m[i]
+
+// The same state with message word `i` set.  Does not move
+// `buffered`: a caller filling the block by words sets it with
+// `with_buffered`.  An index outside 0 ..= 15 returns the state
+// unchanged.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     let st = blake2b.with_block_word(blake2b.zero_state(), 2, 5)
+//     println("${blake2b.block_word(st, 2)}")      // 5
+// ```
+pub @tier(embedded)
+fn with_block_word(st: B2bState, i: Int, v: Int) -> B2bState []
+    if i < 0 or i >= B2B_BLOCK_WORDS
+        st
+    else
+        var r = st
+        r.set_m(i, v)
+        r
+
+// Byte `j` of the block being filled, for `j` in 0 ..= 127, read out
+// of the little-endian word that holds it; zero outside that range.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.block_byte(blake2b.zero_state(), 0)}")   // 0
+// ```
+pub @tier(embedded)
+fn block_byte(st: B2bState, j: Int) -> Int []
+    if j < 0 or j >= B2B_BLOCK_BYTES
+        0
+    else
+        (st.m[j / 8] >>> (8 * (j % 8))) & 0xFF
+
+// The same state with byte `j` of the block set.  Does not move
+// `buffered`.  An index outside 0 ..= 127 returns the state unchanged;
+// `b` is taken modulo 256.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     let st = blake2b.with_block_byte(blake2b.zero_state(), 1, 0xAB)
+//     println("${blake2b.block_byte(st, 1)}")      // 171
+// ```
+pub @tier(embedded)
+fn with_block_byte(st: B2bState, j: Int, b: Int) -> B2bState []
+    if j < 0 or j >= B2B_BLOCK_BYTES
+        st
+    else
+        var r = st
+        r.put(j, b)
+        r
+
+// Bytes of the block that hold message: 0 ..= 128.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.buffered(blake2b.zero_state())}")   // 0
+// ```
+pub @tier(embedded)
+fn buffered(st: B2bState) -> Int []
+    st.buffered
+
+// The same state with `buffered` set.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.buffered(blake2b.with_buffered(blake2b.zero_state(), 7))}")   // 7
+// ```
+pub @tier(embedded)
+fn with_buffered(st: B2bState, n: Int) -> B2bState []
+    var r = st
+    r.set_buffered(n)
+    r
+
+// The same state with every block byte from `buffered` to the end set
+// to zero.
+//
+// What `finish` does before the last compression, published because a
+// caller driving the compression themselves has to do it and because
+// forgetting it hashes whatever the previous block left behind — a
+// bug that produces a stable wrong answer and no symptom.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     let st = blake2b.zero_tail(blake2b.with_block_byte(blake2b.zero_state(), 5, 1))
+//     println("${blake2b.block_byte(st, 5)}")      // 0
+// ```
+pub @tier(embedded)
+fn zero_tail(st: B2bState) -> B2bState []
+    var r = st
+    for j in 0..128
+        if j >= st.buffered
+            r.put(j, 0)
+    r
+
+// ── The counter and the flags ────────────────────────────────────────
+
+// The low half of the byte counter.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.counter_low(blake2b.zero_state())}")   // 0
+// ```
+pub @tier(embedded)
+fn counter_low(st: B2bState) -> Int []
+    st.t0
+
+// The high half of the byte counter.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.counter_high(blake2b.zero_state())}")   // 0
+// ```
+pub @tier(embedded)
+fn counter_high(st: B2bState) -> Int []
+    st.t1
+
+// The same state with `n` added to the 128-bit byte counter, carrying
+// into the high half.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.counter_low(blake2b.add_counter(blake2b.zero_state(), 128))}")   // 128
+// ```
+pub @tier(embedded)
+fn add_counter(st: B2bState, n: Int) -> B2bState []
+    var r = st
+    let lo = int.wrapping_add(st.t0, n)
+    // The carry out of an unsigned 64-bit add, from the sign bits.
+    let carry = ((st.t0 & n) | ((st.t0 | n) & (lo ^ -1))) >>> 63
+    r.set_t0(lo)
+    r.set_t1(int.wrapping_add(st.t1, carry))
+    r
+
+// The same state with the byte counter set outright.
+//
+// For a caller resuming a hash, and for reproducing a reference
+// implementation's intermediate state in a test.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.counter_high(blake2b.with_counter(blake2b.zero_state(), 1, 2))}")   // 2
+// ```
+pub @tier(embedded)
+fn with_counter(st: B2bState, lo: Int, hi: Int) -> B2bState []
+    var r = st
+    r.set_t0(lo)
+    r.set_t1(hi)
+    r
+
+// The same state with the finalisation flag `f0` set to all ones.
+//
+// Applies to the LAST block only.  Setting it early ends the hash
+// early, and the digest is a legal BLAKE2b of a prefix, which is why
+// `finish` is the function to call rather than this one.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.is_last(blake2b.mark_last(blake2b.zero_state()))}")   // true
+// ```
+pub @tier(embedded)
+fn mark_last(st: B2bState) -> B2bState []
+    var r = st
+    r.set_f0(-1)
+    r
+
+// The same state with the last-node flag `f1` set to all ones.
+//
+// Tree mode's flag, for the last node of the last layer.  Sequential
+// hashing never sets it, and this package's one-shots never call this.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.is_last_node(blake2b.mark_last_node(blake2b.zero_state()))}")   // true
+// ```
+pub @tier(embedded)
+fn mark_last_node(st: B2bState) -> B2bState []
+    var r = st
+    r.set_f1(-1)
+    r
+
+// Whether `f0` is set.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.is_last(blake2b.zero_state())}")   // false
+// ```
+pub @tier(embedded)
+fn is_last(st: B2bState) -> Bool []
+    st.f0 != 0
+
+// Whether `f1` is set.
+//
+// ```novo
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.is_last_node(blake2b.zero_state())}")   // false
+// ```
+pub @tier(embedded)
+fn is_last_node(st: B2bState) -> Bool []
+    st.f1 != 0
+
+// Bytes of digest this state will produce.
+//
+// ```novo
+// use b2param
+// use blake2b
+//
+// fn main() [io]
+//     println("${blake2b.digest_length(blake2b.init(b2param.sequential(20)))}")   // 20
+// ```
+pub @tier(embedded)
+fn digest_length(st: B2bState) -> Int []
+    st.outlen
+
+// ── The compression function ─────────────────────────────────────────
+
+// The working vector at the start of a compression: v[0..7] = h,
+// v[8..15] = IV, with v[12] XOR t0, v[13] XOR t1, v[14] XOR f0 and
+// v[15] XOR f1 (RFC 7693 § 3.2).
+//
+// ```novo
+// use b2param
+// use blake2b
+//
+// fn main() [io]
+//     let w = blake2b.work(blake2b.init(b2param.sequential(64)))
+//     println("${blake2b.work_word(w, 12)}")
+// ```
+pub @tier(embedded)
+fn work(st: B2bState) -> B2bWork []
+    B2bWork { v: [st.h[0], st.h[1], st.h[2], st.h[3], st.h[4], st.h[5], st.h[6], st.h[7],
+                  iv(0), iv(1), iv(2), iv(3),
+                  iv(4) ^ st.t0, iv(5) ^ st.t1, iv(6) ^ st.f0, iv(7) ^ st.f1] }
+
+// Working word `i`, for `i` in 0 ..= 15; zero outside that range.
+//
+// ```novo
+// use b2param
+// use blake2b
+//
+// fn main() [io]
+//     let w = blake2b.work(blake2b.init(b2param.sequential(64)))
+//     println("${blake2b.work_word(w, 8)}")        // the first IV word
+// ```
+pub @tier(embedded)
+fn work_word(w: B2bWork, i: Int) -> Int []
+    if i < 0 or i >= B2B_WORK_WORDS
+        0
+    else
+        w.v[i]
+
+// The same working vector with word `i` set.  An index outside
+// 0 ..= 15 returns the vector unchanged.
+//
+// ```novo
+// use b2param
+// use blake2b
+//
+// fn main() [io]
+//     let w = blake2b.with_work_word(blake2b.work(blake2b.init(b2param.sequential(64))), 0, 7)
+//     println("${blake2b.work_word(w, 0)}")        // 7
+// ```
+pub @tier(embedded)
+fn with_work_word(w: B2bWork, i: Int, v: Int) -> B2bWork []
+    if i < 0 or i >= B2B_WORK_WORDS
+        w
+    else
+        var r = w
+        r.set_v(i, v)
+        r
+
+// The G mixing function at lanes `a`, `b`, `c`, `d` with message
+// words `x` and `y` (RFC 7693 § 3.1).
+//
+// Four indices and two message words rather than four words in and
+// four out, because a `@value` cannot be a tuple payload and because
+// this is the shape chacha20-nv's `quarter_round` settled on for the
+// same constraint.  The indices are loop counters, never data.  An
+// index outside 0 ..= 15 returns the vector unchanged.
+//
+// ```novo
+// use b2param
+// use blake2b
+//
+// fn main() [io]
+//     let w = blake2b.work(blake2b.init(b2param.sequential(64)))
+//     println("${blake2b.work_word(blake2b.g(w, 0, 4, 8, 12, 0, 0), 0)}")
+// ```
+pub @tier(embedded)
+fn g(w: B2bWork, a: Int, b: Int, c: Int, d: Int, x: Int, y: Int) -> B2bWork []
+    if a < 0 or a > 15 or b < 0 or b > 15 or c < 0 or c > 15 or d < 0 or d > 15
+        w
+    else
+        var r = w
+        r.mix(a, b, c, d, x, y)
+        r
+
+// One round: the four column mixes and the four diagonal mixes, with
+// the message words σ[r] selects out of the state's block.
+//
+// ```novo
+// use b2param
+// use blake2b
+//
+// fn main() [io]
+//     let st = blake2b.init(b2param.sequential(64))
+//     println("${blake2b.work_word(blake2b.round(blake2b.work(st), st, 0), 0)}")
+// ```
+pub @tier(embedded)
+fn round(w: B2bWork, st: B2bState, r: Int) -> B2bWork []
+    var x = w
+    x.mix_round(st, r)
+    x
+
+// The compression function F: twelve rounds over the state's block,
+// then h[i] = h[i] XOR v[i] XOR v[i+8].
+//
+// Answers the state with the new chaining value and `buffered` back at
+// zero; the counter and the flags are the caller's to move, because
+// the order they move in is what separates a correct implementation
+// from one that is off by a block.
+//
+// ```novo
+// use b2param
+// use blake2b
+//
+// fn main() [io]
+//     let st = blake2b.compress(blake2b.init(b2param.sequential(64)))
+//     println("${blake2b.state_word(st, 0)}")
+// ```
+pub @tier(embedded)
+fn compress(st: B2bState) -> B2bState []
+    var w = work(st)
+    for r in 0..12
+        w.mix_round(st, r)
+    var out = st
+    for i in 0..8
+        out.set_h(i, st.h[i] ^ w.v[i] ^ w.v[i + 8])
+    out.set_buffered(0)
+    out
+
+// ── Feeding and finishing ────────────────────────────────────────────
+
+// One more byte of message.
+//
+// The whole of BLAKE2b's update rule in one function, and the reason
+// the device claim is a hash rather than a fragment: if the block is
+// already full, the counter advances by 128 and THAT block is
+// compressed — proving it was not the last — and only then is the new
+// byte stored.
+//
+// A firmware hashing a flash image calls this in a loop and spends
+// nothing but its own frame.
+//
+// ```novo
+// use b2param
+// use blake2b
+//
+// fn main() [io]
+//     let st = blake2b.feed_byte(blake2b.init(b2param.sequential(32)), 0x61)
+//     println("${blake2b.buffered(st)}")           // 1
+// ```
+pub @tier(embedded)
+fn feed_byte(st: B2bState, b: Int) -> B2bState []
+    var r = st
+    if r.buffered >= B2B_BLOCK_BYTES
+        r = compress(add_counter(r, B2B_BLOCK_BYTES))
+    r.put(r.buffered, b)
+    r.set_buffered(r.buffered + 1)
+    r
+
+// The last compression: zero the tail of the block, advance the
+// counter by the bytes buffered, set `f0`, and compress.
+//
+// Answers the finished state, whose chaining value IS the digest —
+// read it with `digest_byte`.  Calling `feed_byte` afterwards produces
+// a value with no meaning, and the state says so through `is_last`.
+//
+// ```novo
+// use b2param
+// use blake2b
+//
+// fn main() [io]
+//     let st = blake2b.finish(blake2b.init(b2param.sequential(32)))
+//     println("${blake2b.is_last(st)}")            // true
+// ```
+pub @tier(embedded)
+fn finish(st: B2bState) -> B2bState []
+    compress(mark_last(add_counter(zero_tail(st), st.buffered)))
+
+// Byte `i` of the digest, for `i` below `digest_length`, read
+// little-endian out of the chaining value; zero outside that range.
+//
+// Little-endian, which is the half of the output a port gets wrong
+// while the arithmetic is right: BLAKE2b's state words are big
+// numbers and its digest is their bytes in the other order.
+//
+// ```novo
+// use b2param
+// use blake2b
+//
+// fn main() [io]
+//     let st = blake2b.finish(blake2b.init(b2param.sequential(32)))
+//     println("${blake2b.digest_byte(st, 0)}")
+// ```
+pub @tier(embedded)
+fn digest_byte(st: B2bState, i: Int) -> Int []
+    if i < 0 or i >= st.outlen or i >= B2B_DIGEST_BYTES_MOST
+        0
+    else
+        (st.h[i / 8] >>> (8 * (i % 8))) & 0xFF
+
+// ── Internals ────────────────────────────────────────────────────────
+
+impl B2bState
+    // Chaining word `i` replaced.  The caller has checked the index.
+    @tier(embedded)
+    fn set_h(var self, i: Int, v: Int)
+        self.h[i] = v
+
+    // Block word `i` replaced.  The caller has checked the index.
+    @tier(embedded)
+    fn set_m(var self, i: Int, v: Int)
+        self.m[i] = v
+
+    @tier(embedded)
+    fn set_t0(var self, v: Int)
+        self.t0 = v
+
+    @tier(embedded)
+    fn set_t1(var self, v: Int)
+        self.t1 = v
+
+    @tier(embedded)
+    fn set_f0(var self, v: Int)
+        self.f0 = v
+
+    @tier(embedded)
+    fn set_f1(var self, v: Int)
+        self.f1 = v
+
+    @tier(embedded)
+    fn set_buffered(var self, v: Int)
+        self.buffered = v
+
+    @tier(embedded)
+    fn set_outlen(var self, v: Int)
+        self.outlen = v
+
+    // Byte `j`, 0 ..= 127, replaced by `b` taken modulo 256.  The
+    // caller has checked the index.
+    @tier(embedded)
+    fn put(var self, j: Int, b: Int)
+        let sh = 8 * (j % 8)
+        let keep = self.m[j / 8] & ((255 << sh) ^ -1)
+        self.m[j / 8] = keep | ((b & 0xFF) << sh)
+
+impl B2bWork
+    // Working word `i` replaced.  The caller has checked the index.
+    @tier(embedded)
+    fn set_v(var self, i: Int, v: Int)
+        self.v[i] = v
+
+    // G over lanes `a`, `b`, `c`, `d` (RFC 7693 § 3.1).  The caller
+    // has checked the indices.
+    @tier(embedded)
+    fn mix(var self, a: Int, b: Int, c: Int, d: Int, x: Int, y: Int)
+        var va = self.v[a]
+        var vb = self.v[b]
+        var vc = self.v[c]
+        var vd = self.v[d]
+        va = int.wrapping_add(int.wrapping_add(va, vb), x)
+        vd = rotr(vd ^ va, 32)
+        vc = int.wrapping_add(vc, vd)
+        vb = rotr(vb ^ vc, 24)
+        va = int.wrapping_add(int.wrapping_add(va, vb), y)
+        vd = rotr(vd ^ va, 16)
+        vc = int.wrapping_add(vc, vd)
+        vb = rotr(vb ^ vc, 63)
+        self.v[a] = va
+        self.v[b] = vb
+        self.v[c] = vc
+        self.v[d] = vd
+
+    // Round `r`: eight mixes over the message words σ[r] picks.
+    @tier(embedded)
+    fn mix_round(var self, st: B2bState, r: Int)
+        self.mix(0, 4, 8, 12, st.m[sigma(r, 0)], st.m[sigma(r, 1)])
+        self.mix(1, 5, 9, 13, st.m[sigma(r, 2)], st.m[sigma(r, 3)])
+        self.mix(2, 6, 10, 14, st.m[sigma(r, 4)], st.m[sigma(r, 5)])
+        self.mix(3, 7, 11, 15, st.m[sigma(r, 6)], st.m[sigma(r, 7)])
+        self.mix(0, 5, 10, 15, st.m[sigma(r, 8)], st.m[sigma(r, 9)])
+        self.mix(1, 6, 11, 12, st.m[sigma(r, 10)], st.m[sigma(r, 11)])
+        self.mix(2, 7, 8, 13, st.m[sigma(r, 12)], st.m[sigma(r, 13)])
+        self.mix(3, 4, 9, 14, st.m[sigma(r, 14)], st.m[sigma(r, 15)])

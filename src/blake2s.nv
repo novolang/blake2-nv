@@ -1,0 +1,918 @@
+// blake2s.nv — BLAKE2s's state and its compression function, in word
+// algebra with no `Bytes` and no `Str` anywhere in the module.
+//
+// BLAKE2s is not BLAKE2b at half the width, and the differences are
+// exactly five.  A port that changes only the word size produces a
+// hash that passes no vector, so they are written here rather than
+// left to a reader to diff:
+//
+//   the word           32 bits, so every result is masked back to
+//                      0 ..= 2^32-1 — `Int` is 64 bits wide and a
+//                      sum or a rotation that is not masked silently
+//                      keeps the high half.
+//   the block          64 bytes, sixteen words.
+//   the rounds         TEN, not twelve.
+//   the rotations      16, 12, 8, 7 — not 32, 24, 16, 63.
+//   the counter        64 bits as two 32-bit halves, and the parameter
+//                      block puts `node_offset` in SIX bytes rather
+//                      than eight (`b2param.s_word` is where that
+//                      lives).
+//
+// The permutation table σ is the SAME as BLAKE2b's, and BLAKE2s uses
+// its first ten rows because it has ten rounds.  That is the one thing
+// the two algorithms genuinely share.
+//
+// Who wants it.  BLAKE2s is the 32-bit-machine member of the family —
+// a Cortex-M does its arithmetic in single registers where BLAKE2b
+// needs pairs — and it is what an embedded consumer reaches for.  It
+// is also what the WireGuard and Noise constructions specify.  Neither
+// of this package's two named consumers uses it: Argon2 and PASETO v4
+// are both BLAKE2b.  It is here because a `core` crypto package that
+// shipped half of RFC 7693 would send the next device consumer to a
+// second copy.
+//
+// This module builds for a microcontroller, and the whole hash is here:
+// `init`, `feed_byte`, `finish`, `digest_byte`.  The `Bytes` half is
+// `b2bytes`.  The buffer is inside the state, as sixteen words, and
+// BLAKE2 buffers lazily: a full block is compressed when the NEXT byte
+// arrives, never when it fills, because the last block carries the
+// finalisation flag.
+//
+// What is constant time is what `blake2b` says, word for word: `g`,
+// `round` and `compress` are addition, XOR and constant rotation with
+// no data-dependent index; `feed_byte` branches on a message length;
+// the accessors are constant time with respect to the key and not with
+// respect to their index; and nothing here compares anything.
+
+use b2param
+
+// ── Sizes ────────────────────────────────────────────────────────────
+
+// The chaining value, in 32-bit words: eight, which is 256 bits.
+pub const B2S_STATE_WORDS = 8
+
+// The message block, in 32-bit words: sixteen.
+pub const B2S_BLOCK_WORDS = 16
+
+// The message block, in bytes: sixty-four.
+pub const B2S_BLOCK_BYTES = 64
+
+// The working vector, in words: sixteen — the eight chaining words and
+// the eight IV words.
+pub const B2S_WORK_WORDS = 16
+
+// The rounds: ten.  RFC 7693 § 2.5 fixes it.
+pub const B2S_ROUNDS = 10
+
+// The digest, at its longest: 32 bytes.  The same number as
+// `b2param.B2S_OUT_BYTES_MOST`, repeated here so a caller sizing a
+// buffer at the state's own module does not have to reach for another.
+pub const B2S_DIGEST_BYTES_MOST = 32
+
+// The mask that keeps a word 32 bits wide: 2^32 - 1.
+//
+// Public because it is the operation this module has and `blake2b`
+// does not, and a reader comparing the two should be able to see where
+// it is applied rather than infer it.
+pub const B2S_WORD_MASK = 4294967295
+
+// ── The two values ───────────────────────────────────────────────────
+
+// A BLAKE2s hash in flight.
+//
+// The same eight fields as `B2bState` at half the widths: eight
+// chaining words, sixteen block words, a two-word counter, two flags,
+// the bytes buffered and the digest length.  A `@value`, so a device
+// holds two hundred and forty bytes of its own frame and nothing else
+// (an `Int` is eight bytes whatever the word it carries).
+// Every word field is masked to 32 bits; a state whose words are not
+// is a state some function forgot `B2S_WORD_MASK`, and the tests pin
+// that at the block function.
+//
+// ```novo
+// use b2param
+// use blake2s
+//
+// fn main() [io]
+//     let st = blake2s.init(b2param.sequential(32))
+//     println("${blake2s.digest_length(st)}")      // 32
+// ```
+pub @value
+struct B2sState
+    // The chaining value h[0..7], each masked to 32 bits.
+    h: [Int; 8]
+    // The message block being filled, as sixteen little-endian 32-bit
+    // words: byte `j` is bits `8*(j mod 4)` of word `j / 4`.
+    m: [Int; 16]
+    // The low half of the 64-bit byte counter `t`.
+    t0: Int
+    // The high half of the 64-bit byte counter `t`.
+    t1: Int
+    // The finalisation flag `f0`: 0xffffffff on the last block, zero
+    // before it.
+    f0: Int
+    // The last-node flag `f1`: tree mode's, zero in sequential mode.
+    f1: Int
+    // Bytes of `m` that hold message: 0 ..= 64.
+    buffered: Int
+    // Bytes of digest this state will produce, copied out of the
+    // parameter block so `finish` and `digest_byte` need no second
+    // argument.
+    outlen: Int
+
+// The sixteen-word working vector one compression mixes.
+//
+// Its own type rather than a second `B2sState`, because the two are
+// the same shape and mean opposite things — one is a hash a caller may
+// still feed, the other is scratch that is dead the moment the
+// feed-forward has run — and a program that mixed them up would
+// produce a chaining value out of a half-mixed vector and never
+// notice.
+//
+// ```novo
+// use b2param
+// use blake2s
+//
+// fn main() [io]
+//     let w = blake2s.work(blake2s.init(b2param.sequential(32)))
+//     println("${blake2s.work_word(w, 8)}")        // the first IV word
+// ```
+pub @value
+struct B2sWork
+    // v[0..15]: the chaining value, then the IV with `t` and `f`
+    // folded in.
+    v: [Int; 16]
+
+// ── Constants ────────────────────────────────────────────────────────
+
+// IV word `i`, for `i` in 0 ..= 7: SHA-256's initial value, the
+// fractional parts of the square roots of the first eight primes.
+// Zero outside that range.
+//
+// SHA-256's, where BLAKE2b takes SHA-512's — a difference that is easy
+// to state and easy to get wrong by copying the wrong eight numbers.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.iv(0)}")                  // 1779033703
+// ```
+pub @tier(embedded)
+fn iv(i: Int) -> Int []
+    if i == 0
+        1779033703   // 0x6a09e667
+    else if i == 1
+        3144134277   // 0xbb67ae85
+    else if i == 2
+        1013904242   // 0x3c6ef372
+    else if i == 3
+        2773480762   // 0xa54ff53a
+    else if i == 4
+        1359893119   // 0x510e527f
+    else if i == 5
+        2600822924   // 0x9b05688c
+    else if i == 6
+        528734635   // 0x1f83d9ab
+    else if i == 7
+        1541459225   // 0x5be0cd19
+    else
+        0
+
+// One row of the permutation table, sixteen 4-bit indices packed into
+// one word with entry 0 in the lowest nibble.
+@tier(embedded)
+fn sigma_row(r: Int) -> Int
+    if r == 0
+        -81985529216486896   // 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+    else if r == 1
+        3853709921291437230   // 14 10 4 8 9 15 13 6 1 12 0 2 11 7 5 3
+    else if r == 2
+        5266788149650328715   // 11 8 12 0 5 2 15 13 10 14 3 6 7 1 9 4
+    else if r == 3
+        -8141200382097550441   // 7 9 3 1 13 12 11 14 2 6 5 10 4 0 15 8
+    else if r == 4
+        -3204650750919412471   // 9 0 5 7 2 4 10 15 14 1 11 12 6 8 3 13
+    else if r == 5
+        -7931023849780369726   // 2 12 6 10 0 11 8 3 4 13 7 5 15 14 1 9
+    else if r == 6
+        -5176546439255363236   // 12 5 1 15 14 13 4 10 0 7 6 3 9 2 8 11
+    else if r == 7
+        -6744053556625741891   // 13 11 7 14 12 1 3 9 5 0 15 4 8 6 2 10
+    else if r == 8
+        6503616966983130870   // 6 15 14 9 11 3 0 8 12 2 13 7 1 4 10 5
+    else
+        991893350865389610   // 10 2 8 4 7 6 1 5 15 11 9 14 3 12 13 0
+
+// The message-word permutation σ[r][i], for `r` in 0 ..= 9 and `i` in
+// 0 ..= 15 (RFC 7693 § 2.7); zero outside that range.
+//
+// The same table `blake2b.sigma` reads; BLAKE2s stops at row 9 because
+// it has ten rounds, where BLAKE2b wraps back to rows 0 and 1 for its
+// eleventh and twelfth.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.sigma(1, 0)}")            // 14
+// ```
+pub @tier(embedded)
+fn sigma(r: Int, i: Int) -> Int []
+    if r < 0 or r >= B2S_ROUNDS or i < 0 or i > 15
+        0
+    else
+        (sigma_row(r) >>> (4 * i)) & 0xF
+
+// Rotation amount `i`, for `i` in 0 ..= 3: 16, 12, 8, 7 (RFC 7693
+// § 2.1's R1..R4); zero outside that range.
+//
+// BLAKE2b's are 32, 24, 16, 63, and that difference is the whole of
+// what makes the two algorithms two algorithms rather than one at two
+// widths.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.rotation(1)}")            // 12
+// ```
+pub @tier(embedded)
+fn rotation(i: Int) -> Int []
+    if i == 0
+        16
+    else if i == 1
+        12
+    else if i == 2
+        8
+    else if i == 3
+        7
+    else
+        0
+
+// `x` rotated right by `n` bits, over 32, with the result masked.
+// `n` is taken modulo 32.
+//
+// The rotation `blake2b.rotr` is not: a 32-bit rotate has to drop the
+// high half on the way through, and forgetting that is the defect this
+// function exists to have one home for.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.rotr(1, 1)}")             // 2147483648
+// ```
+pub @tier(embedded)
+fn rotr(x: Int, n: Int) -> Int []
+    let k = n & 31
+    let v = x & B2S_WORD_MASK
+    if k == 0
+        v
+    else
+        mask((v >>> k) | (v << (32 - k)))
+
+// `x` masked to 32 bits.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.mask(4294967297)}")       // 1
+// ```
+pub @tier(embedded)
+fn mask(x: Int) -> Int []
+    x & B2S_WORD_MASK
+
+// ── Building and reading a state ─────────────────────────────────────
+
+// A state with every word zero.
+//
+// Not a usable hash — `init` is — but the value a device builds a
+// state out of when it sets words itself, and the one the tests
+// compare a fresh state against.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.counter_low(blake2s.zero_state())}")   // 0
+// ```
+pub @tier(embedded)
+fn zero_state() -> B2sState []
+    B2sState { h: [0, 0, 0, 0, 0, 0, 0, 0],
+               m: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               t0: 0, t1: 0, f0: 0, f1: 0, buffered: 0, outlen: 0 }
+
+// The state RFC 7693 § 2.6 starts from: h[i] = IV[i] XOR the
+// parameter block's word `i`, the counter zero, both flags clear.
+//
+// Takes the SAME `B2Params` BLAKE2b's `init` takes, and reads it
+// through `s_word` rather than `b_word` — which is the whole reason
+// the parameter block is one type and not two.  A caller who sets a
+// sixteen-byte salt and then initialises a BLAKE2s gets the low eight
+// bytes; `b2bytes.check_salt_s` is what refuses the width before that
+// can surprise anyone.
+//
+// This is where the digest length takes effect, which is why
+// BLAKE2s-128 is not BLAKE2s-256 truncated: `digest_length` is byte 0
+// of `b2param.s_word(p, 0)` and is XORed into h[0] before a byte of
+// message is seen.
+//
+// It does NOT feed a key.  A keyed hash's first message block is the
+// zero-padded key, which needs a `Bytes` and so lives in
+// `b2bytes.init_keyed_s`; a device with the key in words calls this
+// and then fills the block itself.
+//
+// ```novo
+// use b2param
+// use blake2s
+//
+// fn main() [io]
+//     let st = blake2s.init(b2param.sequential(32))
+//     println("${blake2s.state_word(st, 0)}")
+// ```
+pub @tier(embedded)
+fn init(p: B2Params) -> B2sState []
+    var st = zero_state()
+    for i in 0..8
+        st.set_h(i, iv(i) ^ b2param.s_word(p, i))
+    st.set_outlen(p.digest_length)
+    st
+
+// Chaining word `i`, for `i` in 0 ..= 7; zero outside that range.
+//
+// ```novo
+// use b2param
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.state_word(blake2s.init(b2param.sequential(32)), 1)}")
+// ```
+pub @tier(embedded)
+fn state_word(st: B2sState, i: Int) -> Int []
+    if i < 0 or i >= B2S_STATE_WORDS
+        0
+    else
+        st.h[i]
+
+// The same state with chaining word `i` set.
+//
+// For a caller resuming a hash from a checkpoint they stored, and for
+// a tree mode that keys a node from another node's output.  An index
+// outside 0 ..= 7 returns the state unchanged.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     let st = blake2s.with_state_word(blake2s.zero_state(), 3, 9)
+//     println("${blake2s.state_word(st, 3)}")      // 9
+// ```
+pub @tier(embedded)
+fn with_state_word(st: B2sState, i: Int, v: Int) -> B2sState []
+    if i < 0 or i >= B2S_STATE_WORDS
+        st
+    else
+        var r = st
+        r.set_h(i, mask(v))
+        r
+
+// Message word `i` of the block being filled, for `i` in 0 ..= 15;
+// zero outside that range.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.block_word(blake2s.zero_state(), 0)}")   // 0
+// ```
+pub @tier(embedded)
+fn block_word(st: B2sState, i: Int) -> Int []
+    if i < 0 or i >= B2S_BLOCK_WORDS
+        0
+    else
+        st.m[i]
+
+// The same state with message word `i` set.  Does not move
+// `buffered`: a caller filling the block by words sets it with
+// `with_buffered`.  An index outside 0 ..= 15 returns the state
+// unchanged.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     let st = blake2s.with_block_word(blake2s.zero_state(), 2, 5)
+//     println("${blake2s.block_word(st, 2)}")      // 5
+// ```
+pub @tier(embedded)
+fn with_block_word(st: B2sState, i: Int, v: Int) -> B2sState []
+    if i < 0 or i >= B2S_BLOCK_WORDS
+        st
+    else
+        var r = st
+        r.set_m(i, mask(v))
+        r
+
+// Byte `j` of the block being filled, for `j` in 0 ..= 127, read out
+// of the little-endian word that holds it; zero outside that range.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.block_byte(blake2s.zero_state(), 0)}")   // 0
+// ```
+pub @tier(embedded)
+fn block_byte(st: B2sState, j: Int) -> Int []
+    if j < 0 or j >= B2S_BLOCK_BYTES
+        0
+    else
+        (st.m[j / 4] >>> (8 * (j % 4))) & 0xFF
+
+// The same state with byte `j` of the block set.  Does not move
+// `buffered`.  An index outside 0 ..= 127 returns the state unchanged;
+// `b` is taken modulo 256.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     let st = blake2s.with_block_byte(blake2s.zero_state(), 1, 0xAB)
+//     println("${blake2s.block_byte(st, 1)}")      // 171
+// ```
+pub @tier(embedded)
+fn with_block_byte(st: B2sState, j: Int, b: Int) -> B2sState []
+    if j < 0 or j >= B2S_BLOCK_BYTES
+        st
+    else
+        var r = st
+        r.put(j, b)
+        r
+
+// Bytes of the block that hold message: 0 ..= 64.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.buffered(blake2s.zero_state())}")   // 0
+// ```
+pub @tier(embedded)
+fn buffered(st: B2sState) -> Int []
+    st.buffered
+
+// The same state with `buffered` set.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.buffered(blake2s.with_buffered(blake2s.zero_state(), 7))}")   // 7
+// ```
+pub @tier(embedded)
+fn with_buffered(st: B2sState, n: Int) -> B2sState []
+    var r = st
+    r.set_buffered(n)
+    r
+
+// The same state with every block byte from `buffered` to the end set
+// to zero.
+//
+// What `finish` does before the last compression, published because a
+// caller driving the compression themselves has to do it and because
+// forgetting it hashes whatever the previous block left behind — a
+// bug that produces a stable wrong answer and no symptom.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     let st = blake2s.zero_tail(blake2s.with_block_byte(blake2s.zero_state(), 5, 1))
+//     println("${blake2s.block_byte(st, 5)}")      // 0
+// ```
+pub @tier(embedded)
+fn zero_tail(st: B2sState) -> B2sState []
+    var r = st
+    for j in 0..64
+        if j >= st.buffered
+            r.put(j, 0)
+    r
+
+// ── The counter and the flags ────────────────────────────────────────
+
+// The low half of the byte counter.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.counter_low(blake2s.zero_state())}")   // 0
+// ```
+pub @tier(embedded)
+fn counter_low(st: B2sState) -> Int []
+    st.t0
+
+// The high half of the byte counter.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.counter_high(blake2s.zero_state())}")   // 0
+// ```
+pub @tier(embedded)
+fn counter_high(st: B2sState) -> Int []
+    st.t1
+
+// The same state with `n` added to the 64-bit byte counter, carrying
+// out of the low half at 2^32 rather than at 2^64 — the carry BLAKE2s
+// has and BLAKE2b, at this language's word width, does not.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.counter_low(blake2s.add_counter(blake2s.zero_state(), 64))}")   // 64
+// ```
+pub @tier(embedded)
+fn add_counter(st: B2sState, n: Int) -> B2sState []
+    var r = st
+    // The low half carries into the high at 2^32; both stay 32 bits.
+    let lo = st.t0 + n
+    r.set_t0(mask(lo))
+    r.set_t1(mask(st.t1 + (lo >>> 32)))
+    r
+
+// The same state with the byte counter set outright.
+//
+// For a caller resuming a hash, and for reproducing a reference
+// implementation's intermediate state in a test.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.counter_high(blake2s.with_counter(blake2s.zero_state(), 1, 2))}")   // 2
+// ```
+pub @tier(embedded)
+fn with_counter(st: B2sState, lo: Int, hi: Int) -> B2sState []
+    var r = st
+    r.set_t0(mask(lo))
+    r.set_t1(mask(hi))
+    r
+
+// The same state with the finalisation flag `f0` set to 0xffffffff.
+//
+// Applies to the LAST block only.  Setting it early ends the hash
+// early, and the digest is a legal BLAKE2s of a prefix, which is why
+// `finish` is the function to call rather than this one.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.is_last(blake2s.mark_last(blake2s.zero_state()))}")   // true
+// ```
+pub @tier(embedded)
+fn mark_last(st: B2sState) -> B2sState []
+    var r = st
+    r.set_f0(B2S_WORD_MASK)
+    r
+
+// The same state with the last-node flag `f1` set to 0xffffffff.
+//
+// Tree mode's flag, for the last node of the last layer.  Sequential
+// hashing never sets it, and this package's one-shots never call this.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.is_last_node(blake2s.mark_last_node(blake2s.zero_state()))}")   // true
+// ```
+pub @tier(embedded)
+fn mark_last_node(st: B2sState) -> B2sState []
+    var r = st
+    r.set_f1(B2S_WORD_MASK)
+    r
+
+// Whether `f0` is set.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.is_last(blake2s.zero_state())}")   // false
+// ```
+pub @tier(embedded)
+fn is_last(st: B2sState) -> Bool []
+    st.f0 != 0
+
+// Whether `f1` is set.
+//
+// ```novo
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.is_last_node(blake2s.zero_state())}")   // false
+// ```
+pub @tier(embedded)
+fn is_last_node(st: B2sState) -> Bool []
+    st.f1 != 0
+
+// Bytes of digest this state will produce.
+//
+// ```novo
+// use b2param
+// use blake2s
+//
+// fn main() [io]
+//     println("${blake2s.digest_length(blake2s.init(b2param.sequential(20)))}")   // 20
+// ```
+pub @tier(embedded)
+fn digest_length(st: B2sState) -> Int []
+    st.outlen
+
+// ── The compression function ─────────────────────────────────────────
+
+// The working vector at the start of a compression: v[0..7] = h,
+// v[8..15] = IV, with v[12] XOR t0, v[13] XOR t1, v[14] XOR f0 and
+// v[15] XOR f1 (RFC 7693 § 3.2).
+//
+// ```novo
+// use b2param
+// use blake2s
+//
+// fn main() [io]
+//     let w = blake2s.work(blake2s.init(b2param.sequential(32)))
+//     println("${blake2s.work_word(w, 12)}")
+// ```
+pub @tier(embedded)
+fn work(st: B2sState) -> B2sWork []
+    B2sWork { v: [st.h[0], st.h[1], st.h[2], st.h[3], st.h[4], st.h[5], st.h[6], st.h[7],
+                  iv(0), iv(1), iv(2), iv(3),
+                  iv(4) ^ st.t0, iv(5) ^ st.t1, iv(6) ^ st.f0, iv(7) ^ st.f1] }
+
+// Working word `i`, for `i` in 0 ..= 15; zero outside that range.
+//
+// ```novo
+// use b2param
+// use blake2s
+//
+// fn main() [io]
+//     let w = blake2s.work(blake2s.init(b2param.sequential(32)))
+//     println("${blake2s.work_word(w, 8)}")        // the first IV word
+// ```
+pub @tier(embedded)
+fn work_word(w: B2sWork, i: Int) -> Int []
+    if i < 0 or i >= B2S_WORK_WORDS
+        0
+    else
+        w.v[i]
+
+// The same working vector with word `i` set.  An index outside
+// 0 ..= 15 returns the vector unchanged.
+//
+// ```novo
+// use b2param
+// use blake2s
+//
+// fn main() [io]
+//     let w = blake2s.with_work_word(blake2s.work(blake2s.init(b2param.sequential(32))), 0, 7)
+//     println("${blake2s.work_word(w, 0)}")        // 7
+// ```
+pub @tier(embedded)
+fn with_work_word(w: B2sWork, i: Int, v: Int) -> B2sWork []
+    if i < 0 or i >= B2S_WORK_WORDS
+        w
+    else
+        var r = w
+        r.set_v(i, mask(v))
+        r
+
+// The G mixing function at lanes `a`, `b`, `c`, `d` with message
+// words `x` and `y` (RFC 7693 § 3.1).
+//
+// Four indices and two message words rather than four words in and
+// four out, because a `@value` cannot be a tuple payload and because
+// this is the shape chacha20-nv's `quarter_round` settled on for the
+// same constraint.  The indices are loop counters, never data.  An
+// index outside 0 ..= 15 returns the vector unchanged.
+//
+// ```novo
+// use b2param
+// use blake2s
+//
+// fn main() [io]
+//     let w = blake2s.work(blake2s.init(b2param.sequential(32)))
+//     println("${blake2s.work_word(blake2s.g(w, 0, 4, 8, 12, 0, 0), 0)}")
+// ```
+pub @tier(embedded)
+fn g(w: B2sWork, a: Int, b: Int, c: Int, d: Int, x: Int, y: Int) -> B2sWork []
+    if a < 0 or a > 15 or b < 0 or b > 15 or c < 0 or c > 15 or d < 0 or d > 15
+        w
+    else
+        var r = w
+        r.mix(a, b, c, d, x, y)
+        r
+
+// One round: the four column mixes and the four diagonal mixes, with
+// the message words σ[r] selects out of the state's block.
+//
+// ```novo
+// use b2param
+// use blake2s
+//
+// fn main() [io]
+//     let st = blake2s.init(b2param.sequential(32))
+//     println("${blake2s.work_word(blake2s.round(blake2s.work(st), st, 0), 0)}")
+// ```
+pub @tier(embedded)
+fn round(w: B2sWork, st: B2sState, r: Int) -> B2sWork []
+    var x = w
+    x.mix_round(st, r)
+    x
+
+// The compression function F: ten rounds over the state's block,
+// then h[i] = h[i] XOR v[i] XOR v[i+8].
+//
+// Answers the state with the new chaining value and `buffered` back at
+// zero; the counter and the flags are the caller's to move, because
+// the order they move in is what separates a correct implementation
+// from one that is off by a block.
+//
+// ```novo
+// use b2param
+// use blake2s
+//
+// fn main() [io]
+//     let st = blake2s.compress(blake2s.init(b2param.sequential(32)))
+//     println("${blake2s.state_word(st, 0)}")
+// ```
+pub @tier(embedded)
+fn compress(st: B2sState) -> B2sState []
+    var w = work(st)
+    for r in 0..10
+        w.mix_round(st, r)
+    var out = st
+    for i in 0..8
+        out.set_h(i, st.h[i] ^ w.v[i] ^ w.v[i + 8])
+    out.set_buffered(0)
+    out
+
+// ── Feeding and finishing ────────────────────────────────────────────
+
+// One more byte of message.
+//
+// The whole of BLAKE2s's update rule in one function, and the reason
+// the device claim is a hash rather than a fragment: if the block is
+// already full, the counter advances by 64 and THAT block is
+// compressed — proving it was not the last — and only then is the new
+// byte stored.
+//
+// A firmware hashing a flash image calls this in a loop and spends
+// nothing but its own frame.
+//
+// ```novo
+// use b2param
+// use blake2s
+//
+// fn main() [io]
+//     let st = blake2s.feed_byte(blake2s.init(b2param.sequential(32)), 0x61)
+//     println("${blake2s.buffered(st)}")           // 1
+// ```
+pub @tier(embedded)
+fn feed_byte(st: B2sState, b: Int) -> B2sState []
+    var r = st
+    if r.buffered >= B2S_BLOCK_BYTES
+        r = compress(add_counter(r, B2S_BLOCK_BYTES))
+    r.put(r.buffered, b)
+    r.set_buffered(r.buffered + 1)
+    r
+
+// The last compression: zero the tail of the block, advance the
+// counter by the bytes buffered, set `f0`, and compress.
+//
+// Answers the finished state, whose chaining value IS the digest —
+// read it with `digest_byte`.  Calling `feed_byte` afterwards produces
+// a value with no meaning, and the state says so through `is_last`.
+//
+// ```novo
+// use b2param
+// use blake2s
+//
+// fn main() [io]
+//     let st = blake2s.finish(blake2s.init(b2param.sequential(32)))
+//     println("${blake2s.is_last(st)}")            // true
+// ```
+pub @tier(embedded)
+fn finish(st: B2sState) -> B2sState []
+    compress(mark_last(add_counter(zero_tail(st), st.buffered)))
+
+// Byte `i` of the digest, for `i` below `digest_length`, read
+// little-endian out of the chaining value; zero outside that range.
+//
+// Little-endian, which is the half of the output a port gets wrong
+// while the arithmetic is right: BLAKE2s's state words are big
+// numbers and its digest is their bytes in the other order.
+//
+// ```novo
+// use b2param
+// use blake2s
+//
+// fn main() [io]
+//     let st = blake2s.finish(blake2s.init(b2param.sequential(32)))
+//     println("${blake2s.digest_byte(st, 0)}")
+// ```
+pub @tier(embedded)
+fn digest_byte(st: B2sState, i: Int) -> Int []
+    if i < 0 or i >= st.outlen or i >= B2S_DIGEST_BYTES_MOST
+        0
+    else
+        (st.h[i / 4] >>> (8 * (i % 4))) & 0xFF
+
+// ── Internals ────────────────────────────────────────────────────────
+
+impl B2sState
+    // Chaining word `i` replaced.  The caller has checked the index.
+    @tier(embedded)
+    fn set_h(var self, i: Int, v: Int)
+        self.h[i] = v
+
+    // Block word `i` replaced.  The caller has checked the index.
+    @tier(embedded)
+    fn set_m(var self, i: Int, v: Int)
+        self.m[i] = v
+
+    @tier(embedded)
+    fn set_t0(var self, v: Int)
+        self.t0 = v
+
+    @tier(embedded)
+    fn set_t1(var self, v: Int)
+        self.t1 = v
+
+    @tier(embedded)
+    fn set_f0(var self, v: Int)
+        self.f0 = v
+
+    @tier(embedded)
+    fn set_f1(var self, v: Int)
+        self.f1 = v
+
+    @tier(embedded)
+    fn set_buffered(var self, v: Int)
+        self.buffered = v
+
+    @tier(embedded)
+    fn set_outlen(var self, v: Int)
+        self.outlen = v
+
+    // Byte `j`, 0 ..= 127, replaced by `b` taken modulo 256.  The
+    // caller has checked the index.
+    @tier(embedded)
+    fn put(var self, j: Int, b: Int)
+        let sh = 8 * (j % 4)
+        let keep = self.m[j / 4] & ((255 << sh) ^ B2S_WORD_MASK)
+        self.m[j / 4] = keep | ((b & 0xFF) << sh)
+
+impl B2sWork
+    // Working word `i` replaced.  The caller has checked the index.
+    @tier(embedded)
+    fn set_v(var self, i: Int, v: Int)
+        self.v[i] = v
+
+    // G over lanes `a`, `b`, `c`, `d` (RFC 7693 § 3.1).  The caller
+    // has checked the indices.
+    @tier(embedded)
+    fn mix(var self, a: Int, b: Int, c: Int, d: Int, x: Int, y: Int)
+        var va = self.v[a]
+        var vb = self.v[b]
+        var vc = self.v[c]
+        var vd = self.v[d]
+        va = mask(va + vb + x)
+        vd = rotr(vd ^ va, 16)
+        vc = mask(vc + vd)
+        vb = rotr(vb ^ vc, 12)
+        va = mask(va + vb + y)
+        vd = rotr(vd ^ va, 8)
+        vc = mask(vc + vd)
+        vb = rotr(vb ^ vc, 7)
+        self.v[a] = va
+        self.v[b] = vb
+        self.v[c] = vc
+        self.v[d] = vd
+
+    // Round `r`: eight mixes over the message words σ[r] picks.
+    @tier(embedded)
+    fn mix_round(var self, st: B2sState, r: Int)
+        self.mix(0, 4, 8, 12, st.m[sigma(r, 0)], st.m[sigma(r, 1)])
+        self.mix(1, 5, 9, 13, st.m[sigma(r, 2)], st.m[sigma(r, 3)])
+        self.mix(2, 6, 10, 14, st.m[sigma(r, 4)], st.m[sigma(r, 5)])
+        self.mix(3, 7, 11, 15, st.m[sigma(r, 6)], st.m[sigma(r, 7)])
+        self.mix(0, 5, 10, 15, st.m[sigma(r, 8)], st.m[sigma(r, 9)])
+        self.mix(1, 6, 11, 12, st.m[sigma(r, 10)], st.m[sigma(r, 11)])
+        self.mix(2, 7, 8, 13, st.m[sigma(r, 12)], st.m[sigma(r, 13)])
+        self.mix(3, 4, 9, 14, st.m[sigma(r, 14)], st.m[sigma(r, 15)])

@@ -1,0 +1,895 @@
+// blake2_edge_tests.nv — the accessors, the refusals and the out-of-range
+// reads of every module, so that each line of src/ is reached and each
+// answer is pinned.  The digests themselves are in generated_vectors_tests.nv
+// and blake2_tests.nv.
+
+use std.bytes
+use std.test
+use b2err
+use b2param
+use b2bytes
+use blake2b
+use blake2s
+
+fn hex(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+fn is_some(e: ?B2Error) -> Bool
+    match e
+        Some(_) => true
+        None    => false
+
+fn text_of(e: ?B2Error) -> Str
+    match e
+        Some(x) => x.message()
+        None    => ""
+
+// ── b2err ────────────────────────────────────────────────────────────
+
+@test
+fn test_every_error_has_a_message_that_names_its_numbers() [io]
+    test.assert_eq_str(b2err.describe(B2DigestLengthOutOfRange(65, 64)), "the digest length is 65, want 1 to 64")
+    test.assert_eq_str(b2err.describe(B2KeyTooLong(65, 64)), "the key is 65 bytes, the most is 64")
+    test.assert_eq_str(b2err.describe(B2SaltWidthWrong(3, 16)), "the salt is 3 bytes, want 16 or none")
+    test.assert_eq_str(b2err.describe(B2PersonalWidthWrong(3, 8)), "the personalisation is 3 bytes, want 8 or none")
+    test.assert_eq_str(b2err.describe(B2OutputTooSmall(32, 16)), "the output buffer has 16 bytes, want 32")
+    test.assert_eq_str(b2err.describe(B2TreeModeNotDriven(4, 2)),
+        "tree mode (fanout 4, depth 2) is not driven by the one-shots")
+
+@test
+fn test_only_the_tree_mode_refusal_is_not_a_width_fault() [io]
+    test.assert(b2err.is_width_fault(B2DigestLengthOutOfRange(0, 64)))
+    test.assert(b2err.is_width_fault(B2KeyTooLong(65, 64)))
+    test.assert(b2err.is_width_fault(B2SaltWidthWrong(1, 16)))
+    test.assert(b2err.is_width_fault(B2PersonalWidthWrong(1, 16)))
+    test.assert(b2err.is_width_fault(B2OutputTooSmall(2, 1)))
+    test.assert(not b2err.is_width_fault(B2TreeModeNotDriven(0, 0)))
+
+// ── b2param ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_sequential_block_reads_back_as_set() [io]
+    let p = b2param.sequential(20)
+    test.assert_eq(b2param.digest_length(p), 20)
+    test.assert_eq(b2param.key_length(p), 0)
+    test.assert_eq(b2param.fanout(p), 1)
+    test.assert_eq(b2param.depth(p), 1)
+    test.assert_eq(b2param.leaf_length(p), 0)
+    test.assert_eq(b2param.node_offset(p), 0)
+    test.assert_eq(b2param.node_depth(p), 0)
+    test.assert_eq(b2param.inner_length(p), 0)
+    test.assert_eq(b2param.salt_lo(p), 0)
+    test.assert_eq(b2param.salt_hi(p), 0)
+    test.assert_eq(b2param.personal_lo(p), 0)
+    test.assert_eq(b2param.personal_hi(p), 0)
+    test.assert(b2param.is_sequential(p))
+
+@test
+fn test_keyed_with_a_zero_key_length_is_sequential_byte_for_byte() [io]
+    let a = b2param.keyed(32, 0)
+    let b = b2param.sequential(32)
+    for i in 0..8
+        test.assert_eq(b2param.b_word(a, i), b2param.b_word(b, i))
+        test.assert_eq(b2param.s_word(a, i), b2param.s_word(b, i))
+    test.assert_eq(b2param.key_length(b2param.keyed(32, 16)), 16)
+
+@test
+fn test_the_setters_change_only_their_own_fields() [io]
+    let p = b2param.with_digest_length(b2param.with_personal(b2param.with_salt(b2param.keyed(32, 5), 11, 12), 13, 14), 40)
+    test.assert_eq(b2param.digest_length(p), 40)
+    test.assert_eq(b2param.key_length(p), 5)
+    test.assert_eq(b2param.salt_lo(p), 11)
+    test.assert_eq(b2param.salt_hi(p), 12)
+    test.assert_eq(b2param.personal_lo(p), 13)
+    test.assert_eq(b2param.personal_hi(p), 14)
+    test.assert(b2param.is_sequential(p))
+    let t = b2param.with_tree(p, 4, 2, 4096, 7, 1, 64)
+    test.assert_eq(b2param.fanout(t), 4)
+    test.assert_eq(b2param.depth(t), 2)
+    test.assert_eq(b2param.leaf_length(t), 4096)
+    test.assert_eq(b2param.node_offset(t), 7)
+    test.assert_eq(b2param.node_depth(t), 1)
+    test.assert_eq(b2param.inner_length(t), 64)
+    test.assert_eq(b2param.salt_hi(t), 12)
+    test.assert(not b2param.is_sequential(t))
+
+@test
+fn test_each_tree_field_alone_makes_a_block_non_sequential() [io]
+    let p = b2param.sequential(32)
+    test.assert(not b2param.is_sequential(b2param.with_tree(p, 0, 1, 0, 0, 0, 0)))
+    test.assert(not b2param.is_sequential(b2param.with_tree(p, 1, 0, 0, 0, 0, 0)))
+    test.assert(not b2param.is_sequential(b2param.with_tree(p, 1, 1, 1, 0, 0, 0)))
+    test.assert(not b2param.is_sequential(b2param.with_tree(p, 1, 1, 0, 1, 0, 0)))
+    test.assert(not b2param.is_sequential(b2param.with_tree(p, 1, 1, 0, 0, 1, 0)))
+    test.assert(not b2param.is_sequential(b2param.with_tree(p, 1, 1, 0, 0, 0, 1)))
+    test.assert(b2param.is_sequential(b2param.with_tree(p, 1, 1, 0, 0, 0, 0)))
+
+@test
+fn test_the_first_parameter_word_of_a_sequential_block_is_the_rfc_value() [io]
+    test.case("digest 32, fanout 1, depth 1 is 0x01010020")
+    test.assert_eq(b2param.b_word(b2param.sequential(32), 0), 16842784)
+    test.assert_eq(b2param.s_word(b2param.sequential(32), 0), 16842784)
+    test.case("a key length of 16 goes in byte 1")
+    test.assert_eq(b2param.b_word(b2param.keyed(32, 16), 0), 16842784 + 16 * 256)
+    test.case("the words that are reserved or out of range are zero")
+    for i in [3, 8, 100, -1]
+        test.assert_eq(b2param.b_word(b2param.sequential(32), i), 0)
+        test.assert_eq(b2param.s_word(b2param.sequential(32), i), 0)
+
+@test
+fn test_blake2s_puts_the_node_offset_in_six_bytes_across_two_words() [io]
+    let p = b2param.with_tree(b2param.sequential(32), 1, 1, 9, 0x0123456789AB, 3, 4)
+    test.assert_eq(b2param.s_word(p, 1), 9)
+    test.assert_eq(b2param.s_word(p, 2), 0x456789AB)
+    test.assert_eq(b2param.s_word(p, 3), 0x0123 | (3 << 16) | (4 << 24))
+    test.case("BLAKE2b keeps the whole offset in word 1 and the depths in word 2")
+    let q = b2param.with_tree(b2param.sequential(32), 1, 1, 9, 0x0123456789AB, 3, 4)
+    test.assert_eq(b2param.b_word(q, 1), 0x0123456789AB)
+    test.assert_eq(b2param.b_word(q, 2), 3 | (4 << 8))
+    test.assert_eq(b2param.b_word(q, 0), 16842784 | (9 << 32))
+
+@test
+fn test_blake2s_reads_the_low_eight_bytes_of_the_salt_and_personalisation() [io]
+    let p = b2param.with_personal(b2param.with_salt(b2param.sequential(32), 0x1122334455667788, 5), 0x0A0B0C0D0E0F1011, 6)
+    test.assert_eq(b2param.s_word(p, 4), 0x55667788)
+    test.assert_eq(b2param.s_word(p, 5), 0x11223344)
+    test.assert_eq(b2param.s_word(p, 6), 0x0E0F1011)
+    test.assert_eq(b2param.s_word(p, 7), 0x0A0B0C0D)
+    test.assert_eq(b2param.b_word(p, 4), 0x1122334455667788)
+    test.assert_eq(b2param.b_word(p, 5), 5)
+    test.assert_eq(b2param.b_word(p, 6), 0x0A0B0C0D0E0F1011)
+    test.assert_eq(b2param.b_word(p, 7), 6)
+
+@test
+fn test_check_b_and_check_s_refuse_each_out_of_range_field() [io]
+    test.case("digest length")
+    test.assert_eq_str(text_of(b2bytes.check_b(b2param.sequential(0))), "the digest length is 0, want 1 to 64")
+    test.assert_eq_str(text_of(b2bytes.check_b(b2param.sequential(65))), "the digest length is 65, want 1 to 64")
+    test.assert_eq_str(text_of(b2bytes.check_s(b2param.sequential(0))), "the digest length is 0, want 1 to 32")
+    test.assert_eq_str(text_of(b2bytes.check_s(b2param.sequential(33))), "the digest length is 33, want 1 to 32")
+    test.case("key length")
+    test.assert_eq_str(text_of(b2bytes.check_b(b2param.keyed(32, 65))), "the key is 65 bytes, the most is 64")
+    test.assert_eq_str(text_of(b2bytes.check_b(b2param.keyed(32, -1))), "the key is -1 bytes, the most is 64")
+    test.assert_eq_str(text_of(b2bytes.check_s(b2param.keyed(32, 33))), "the key is 33 bytes, the most is 32")
+    test.assert_eq_str(text_of(b2bytes.check_s(b2param.keyed(32, -1))), "the key is -1 bytes, the most is 32")
+    test.case("the edges are accepted")
+    test.assert(not is_some(b2bytes.check_b(b2param.keyed(1, 64))))
+    test.assert(not is_some(b2bytes.check_b(b2param.keyed(64, 0))))
+    test.assert(not is_some(b2bytes.check_s(b2param.keyed(1, 32))))
+    test.assert(not is_some(b2bytes.check_s(b2param.keyed(32, 0))))
+
+// ── blake2b ──────────────────────────────────────────────────────────
+
+@test
+fn test_blake2b_constants_and_tables() [io]
+    test.assert_eq(blake2b.B2B_STATE_WORDS, 8)
+    test.assert_eq(blake2b.B2B_BLOCK_WORDS, 16)
+    test.assert_eq(blake2b.B2B_BLOCK_BYTES, 128)
+    test.assert_eq(blake2b.B2B_WORK_WORDS, 16)
+    test.assert_eq(blake2b.B2B_ROUNDS, 12)
+    test.assert_eq(blake2b.B2B_DIGEST_BYTES_MOST, 64)
+    test.case("IV words are SHA-512's, five of them negative as Int")
+    test.assert_eq(blake2b.iv(0), 0x6a09e667f3bcc908)
+    test.assert_eq(blake2b.iv(1) >>> 32, 0xbb67ae85)
+    test.assert_eq(blake2b.iv(1) & 0xFFFFFFFF, 0x84caa73b)
+    test.assert_eq(blake2b.iv(2), 0x3c6ef372fe94f82b)
+    test.assert_eq(blake2b.iv(3) >>> 32, 0xa54ff53a)
+    test.assert_eq(blake2b.iv(3) & 0xFFFFFFFF, 0x5f1d36f1)
+    test.assert_eq(blake2b.iv(4), 0x510e527fade682d1)
+    test.assert_eq(blake2b.iv(5) >>> 32, 0x9b05688c)
+    test.assert_eq(blake2b.iv(5) & 0xFFFFFFFF, 0x2b3e6c1f)
+    test.assert_eq(blake2b.iv(6), 0x1f83d9abfb41bd6b)
+    test.assert_eq(blake2b.iv(7), 0x5be0cd19137e2179)
+    test.assert_eq(blake2b.iv(8), 0)
+    test.assert_eq(blake2b.iv(-1), 0)
+    test.case("rotation amounts")
+    test.assert_eq(blake2b.rotation(0), 32)
+    test.assert_eq(blake2b.rotation(1), 24)
+    test.assert_eq(blake2b.rotation(2), 16)
+    test.assert_eq(blake2b.rotation(3), 63)
+    test.assert_eq(blake2b.rotation(4), 0)
+    test.assert_eq(blake2b.rotation(-1), 0)
+
+@test
+fn test_blake2b_sigma_is_the_rfc_table_and_rounds_ten_and_eleven_reuse_rows_zero_and_one() [io]
+    var row1 = []
+    for i in 0..16
+        row1 = list.concat(row1, [blake2b.sigma(1, i)])
+    test.assert_eq(row1, [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3])
+    for i in 0..16
+        test.assert_eq(blake2b.sigma(0, i), i)
+        test.assert_eq(blake2b.sigma(10, i), blake2b.sigma(0, i))
+        test.assert_eq(blake2b.sigma(11, i), blake2b.sigma(1, i))
+    test.assert_eq(blake2b.sigma(9, 15), 0)
+    test.assert_eq(blake2b.sigma(5, 0), 2)
+    test.assert_eq(blake2b.sigma(8, 0), 6)
+    test.assert_eq(blake2b.sigma(2, 0), 11)
+    test.assert_eq(blake2b.sigma(3, 0), 7)
+    test.assert_eq(blake2b.sigma(4, 0), 9)
+    test.assert_eq(blake2b.sigma(6, 0), 12)
+    test.assert_eq(blake2b.sigma(7, 0), 13)
+    test.case("outside the table")
+    test.assert_eq(blake2b.sigma(-1, 0), 0)
+    test.assert_eq(blake2b.sigma(12, 0), 0)
+    test.assert_eq(blake2b.sigma(1, -1), 0)
+    test.assert_eq(blake2b.sigma(1, 16), 0)
+
+@test
+fn test_blake2b_rotr_is_a_64_bit_rotation() [io]
+    test.assert_eq(blake2b.rotr(0x0123456789abcdef, 8), -1224658842671273011)
+    test.assert_eq(blake2b.rotr(0x0123456789abcdef, 63), 163971058432973790)
+    test.assert_eq(blake2b.rotr(0x0123456789abcdef, 0), 0x0123456789abcdef)
+    test.assert_eq(blake2b.rotr(0x0123456789abcdef, 64), 0x0123456789abcdef)
+    test.assert_eq(blake2b.rotr(1, 1) >>> 63, 1)
+    test.assert(blake2b.rotr(1, 1) < 0)
+
+@test
+fn test_a_fresh_blake2b_state_holds_the_parameter_block_xor_the_iv() [io]
+    let z = blake2b.zero_state()
+    for i in 0..8
+        test.assert_eq(blake2b.state_word(z, i), 0)
+    test.assert_eq(blake2b.digest_length(z), 0)
+    let st = blake2b.init(b2param.sequential(32))
+    test.assert_eq(blake2b.state_word(st, 0), blake2b.iv(0) ^ 16842784)
+    for i in 1..8
+        test.assert_eq(blake2b.state_word(st, i), blake2b.iv(i))
+    test.assert_eq(blake2b.digest_length(st), 32)
+    test.assert_eq(blake2b.buffered(st), 0)
+    test.assert_eq(blake2b.counter_low(st), 0)
+    test.assert_eq(blake2b.counter_high(st), 0)
+    test.assert(not blake2b.is_last(st))
+    test.assert(not blake2b.is_last_node(st))
+    test.case("two digest lengths give different first words")
+    test.assert(blake2b.state_word(blake2b.init(b2param.sequential(64)), 0) != blake2b.state_word(st, 0))
+
+@test
+fn test_blake2b_word_accessors_answer_zero_or_unchanged_out_of_range() [io]
+    let st = blake2b.with_state_word(blake2b.zero_state(), 3, 9)
+    test.assert_eq(blake2b.state_word(st, 3), 9)
+    test.assert_eq(blake2b.state_word(st, 8), 0)
+    test.assert_eq(blake2b.state_word(st, -1), 0)
+    let same = blake2b.with_state_word(st, 8, 5)
+    let same2 = blake2b.with_state_word(st, -1, 5)
+    for i in 0..8
+        test.assert_eq(blake2b.state_word(same, i), blake2b.state_word(st, i))
+        test.assert_eq(blake2b.state_word(same2, i), blake2b.state_word(st, i))
+    let m = blake2b.with_block_word(blake2b.zero_state(), 15, 77)
+    test.assert_eq(blake2b.block_word(m, 15), 77)
+    test.assert_eq(blake2b.block_word(m, 16), 0)
+    test.assert_eq(blake2b.block_word(m, -1), 0)
+    let m2 = blake2b.with_block_word(m, 16, 5)
+    let m3 = blake2b.with_block_word(m, -1, 5)
+    for i in 0..16
+        test.assert_eq(blake2b.block_word(m2, i), blake2b.block_word(m, i))
+        test.assert_eq(blake2b.block_word(m3, i), blake2b.block_word(m, i))
+    let w = blake2b.with_work_word(blake2b.work(st), 5, 4)
+    test.assert_eq(blake2b.work_word(w, 5), 4)
+    test.assert_eq(blake2b.work_word(w, 16), 0)
+    test.assert_eq(blake2b.work_word(w, -1), 0)
+    let w2 = blake2b.with_work_word(w, 16, 1)
+    let w3 = blake2b.with_work_word(w, -1, 1)
+    for i in 0..16
+        test.assert_eq(blake2b.work_word(w2, i), blake2b.work_word(w, i))
+        test.assert_eq(blake2b.work_word(w3, i), blake2b.work_word(w, i))
+
+@test
+fn test_blake2b_block_bytes_are_little_endian_within_their_word() [io]
+    var st = blake2b.zero_state()
+    st = blake2b.with_block_byte(st, 0, 0x11)
+    st = blake2b.with_block_byte(st, 1, 0x22)
+    st = blake2b.with_block_byte(st, 7, 0x88)
+    st = blake2b.with_block_byte(st, 8, 0x99)
+    st = blake2b.with_block_byte(st, 127, 0xFF)
+    test.assert_eq(blake2b.block_word(st, 0) & 0xFFFF, 0x2211)
+    test.assert_eq(blake2b.block_word(st, 0) >>> 56, 0x88)
+    test.assert_eq(blake2b.block_word(st, 1), 0x99)
+    test.assert_eq(blake2b.block_byte(st, 0), 0x11)
+    test.assert_eq(blake2b.block_byte(st, 1), 0x22)
+    test.assert_eq(blake2b.block_byte(st, 7), 0x88)
+    test.assert_eq(blake2b.block_byte(st, 8), 0x99)
+    test.assert_eq(blake2b.block_byte(st, 127), 0xFF)
+    test.assert_eq(blake2b.block_byte(st, 2), 0)
+    test.case("overwriting a byte keeps its neighbours, and a byte is taken modulo 256")
+    let over = blake2b.with_block_byte(st, 1, 0x1AB)
+    test.assert_eq(blake2b.block_byte(over, 1), 0xAB)
+    test.assert_eq(blake2b.block_byte(over, 0), 0x11)
+    test.assert_eq(blake2b.block_byte(over, 7), 0x88)
+    test.case("outside 0 ..= 127")
+    test.assert_eq(blake2b.block_byte(st, 128), 0)
+    test.assert_eq(blake2b.block_byte(st, -1), 0)
+    let a = blake2b.with_block_byte(st, 128, 1)
+    let b = blake2b.with_block_byte(st, -1, 1)
+    for i in 0..16
+        test.assert_eq(blake2b.block_word(a, i), blake2b.block_word(st, i))
+        test.assert_eq(blake2b.block_word(b, i), blake2b.block_word(st, i))
+
+@test
+fn test_zero_tail_clears_from_buffered_on_and_keeps_what_is_before_it() [io]
+    var st = blake2b.zero_state()
+    for j in 0..128
+        st = blake2b.with_block_byte(st, j, 0xAA)
+    let cut = blake2b.zero_tail(blake2b.with_buffered(st, 100))
+    test.assert_eq(blake2b.block_byte(cut, 99), 0xAA)
+    test.assert_eq(blake2b.block_byte(cut, 100), 0)
+    test.assert_eq(blake2b.block_byte(cut, 127), 0)
+    test.assert_eq(blake2b.buffered(cut), 100)
+    let full = blake2b.zero_tail(blake2b.with_buffered(st, 128))
+    test.assert_eq(blake2b.block_byte(full, 127), 0xAA)
+    let all = blake2b.zero_tail(blake2b.with_buffered(st, -3))
+    test.assert_eq(blake2b.block_byte(all, 0), 0)
+
+@test
+fn test_the_blake2b_counter_carries_into_the_high_half() [io]
+    let st = blake2b.zero_state()
+    test.assert_eq(blake2b.counter_low(blake2b.add_counter(st, 128)), 128)
+    test.assert_eq(blake2b.counter_high(blake2b.add_counter(st, 128)), 0)
+    test.case("all ones plus one carries")
+    let top = blake2b.with_counter(st, -1, 0)
+    let c = blake2b.add_counter(top, 1)
+    test.assert_eq(blake2b.counter_low(c), 0)
+    test.assert_eq(blake2b.counter_high(c), 1)
+    test.case("a carry is only a carry when the unsigned sum wraps")
+    let mid = blake2b.with_counter(st, -2, 5)
+    let d = blake2b.add_counter(mid, 1)
+    test.assert_eq(blake2b.counter_low(d), -1)
+    test.assert_eq(blake2b.counter_high(d), 5)
+    let e = blake2b.add_counter(blake2b.with_counter(st, 1 << 62, 0), 1 << 62)
+    test.assert_eq(blake2b.counter_low(e), -9223372036854775807 - 1)
+    test.assert_eq(blake2b.counter_high(e), 0)
+    let f = blake2b.add_counter(blake2b.with_counter(st, -1, 7), 1 << 62)
+    test.assert_eq(blake2b.counter_low(f), (1 << 62) - 1)
+    test.assert_eq(blake2b.counter_high(f), 8)
+    let g = blake2b.with_counter(st, 3, 4)
+    test.assert_eq(blake2b.counter_low(g), 3)
+    test.assert_eq(blake2b.counter_high(g), 4)
+
+@test
+fn test_the_blake2b_flags_are_all_ones_once_set() [io]
+    let st = blake2b.zero_state()
+    test.assert(blake2b.is_last(blake2b.mark_last(st)))
+    test.assert(not blake2b.is_last_node(blake2b.mark_last(st)))
+    test.assert(blake2b.is_last_node(blake2b.mark_last_node(st)))
+    test.assert(not blake2b.is_last(blake2b.mark_last_node(st)))
+    let w = blake2b.work(blake2b.mark_last_node(blake2b.mark_last(blake2b.with_counter(st, 5, 6))))
+    test.assert_eq(blake2b.work_word(w, 12), blake2b.iv(4) ^ 5)
+    test.assert_eq(blake2b.work_word(w, 13), blake2b.iv(5) ^ 6)
+    test.assert_eq(blake2b.work_word(w, 14), blake2b.iv(6) ^ -1)
+    test.assert_eq(blake2b.work_word(w, 15), blake2b.iv(7) ^ -1)
+
+@test
+fn test_g_with_an_index_out_of_range_changes_nothing() [io]
+    let w = blake2b.work(blake2b.init(b2param.sequential(32)))
+    for bad in [-1, 16]
+        let a = blake2b.g(w, bad, 4, 8, 12, 1, 2)
+        let b = blake2b.g(w, 0, bad, 8, 12, 1, 2)
+        let c = blake2b.g(w, 0, 4, bad, 12, 1, 2)
+        let d = blake2b.g(w, 0, 4, 8, bad, 1, 2)
+        for i in 0..16
+            test.assert_eq(blake2b.work_word(a, i), blake2b.work_word(w, i))
+            test.assert_eq(blake2b.work_word(b, i), blake2b.work_word(w, i))
+            test.assert_eq(blake2b.work_word(c, i), blake2b.work_word(w, i))
+            test.assert_eq(blake2b.work_word(d, i), blake2b.work_word(w, i))
+    let ok = blake2b.g(w, 0, 4, 8, 12, 1, 2)
+    test.assert(blake2b.work_word(ok, 0) != blake2b.work_word(w, 0))
+
+@test
+fn test_feed_byte_compresses_a_full_block_only_when_the_next_byte_arrives() [io]
+    var st = blake2b.init(b2param.sequential(32))
+    for i in 0..128
+        st = blake2b.feed_byte(st, i)
+    test.case("a full block is held, not compressed")
+    test.assert_eq(blake2b.buffered(st), 128)
+    test.assert_eq(blake2b.counter_low(st), 0)
+    test.assert_eq(blake2b.block_byte(st, 127), 127)
+    test.case("the next byte compresses it and starts the next block")
+    let next = blake2b.feed_byte(st, 0x5A)
+    test.assert_eq(blake2b.buffered(next), 1)
+    test.assert_eq(blake2b.counter_low(next), 128)
+    test.assert_eq(blake2b.block_byte(next, 0), 0x5A)
+    test.assert(blake2b.state_word(next, 0) != blake2b.state_word(st, 0))
+    test.case("a byte is taken modulo 256")
+    test.assert_eq(blake2b.block_byte(blake2b.feed_byte(blake2b.init(b2param.sequential(32)), 0x1FF), 0), 0xFF)
+
+@test
+fn test_finish_sets_the_flag_counts_the_bytes_and_empties_the_buffer() [io]
+    var st = blake2b.init(b2param.sequential(32))
+    for i in 0..5
+        st = blake2b.feed_byte(st, i)
+    let done = blake2b.finish(st)
+    test.assert(blake2b.is_last(done))
+    test.assert_eq(blake2b.counter_low(done), 5)
+    test.assert_eq(blake2b.buffered(done), 0)
+    test.case("digest bytes outside 0 ..< digest length are zero")
+    test.assert(blake2b.digest_byte(done, 0) != 0 or blake2b.digest_byte(done, 1) != 0)
+    test.assert_eq(blake2b.digest_byte(done, 32), 0)
+    test.assert_eq(blake2b.digest_byte(done, -1), 0)
+    test.assert_eq(blake2b.digest_byte(blake2b.zero_state(), 0), 0)
+    var wide = blake2b.zero_state()
+    wide = blake2b.with_state_word(wide, 0, 1)
+    wide = blake2b.with_state_word(wide, 1, 2)
+    test.assert_eq(blake2b.digest_byte(wide, 0), 0)
+    test.assert_eq(blake2b.digest_byte(wide, 64), 0)
+
+// ── blake2s ──────────────────────────────────────────────────────────
+
+@test
+fn test_blake2s_constants_and_tables() [io]
+    test.assert_eq(blake2s.B2S_STATE_WORDS, 8)
+    test.assert_eq(blake2s.B2S_BLOCK_WORDS, 16)
+    test.assert_eq(blake2s.B2S_BLOCK_BYTES, 64)
+    test.assert_eq(blake2s.B2S_WORK_WORDS, 16)
+    test.assert_eq(blake2s.B2S_ROUNDS, 10)
+    test.assert_eq(blake2s.B2S_DIGEST_BYTES_MOST, 32)
+    test.assert_eq(blake2s.B2S_WORD_MASK, 0xFFFFFFFF)
+    test.case("IV words are SHA-256's")
+    test.assert_eq(blake2s.iv(0), 0x6a09e667)
+    test.assert_eq(blake2s.iv(1), 0xbb67ae85)
+    test.assert_eq(blake2s.iv(2), 0x3c6ef372)
+    test.assert_eq(blake2s.iv(3), 0xa54ff53a)
+    test.assert_eq(blake2s.iv(4), 0x510e527f)
+    test.assert_eq(blake2s.iv(5), 0x9b05688c)
+    test.assert_eq(blake2s.iv(6), 0x1f83d9ab)
+    test.assert_eq(blake2s.iv(7), 0x5be0cd19)
+    test.assert_eq(blake2s.iv(8), 0)
+    test.assert_eq(blake2s.iv(-1), 0)
+    test.case("rotation amounts")
+    test.assert_eq(blake2s.rotation(0), 16)
+    test.assert_eq(blake2s.rotation(1), 12)
+    test.assert_eq(blake2s.rotation(2), 8)
+    test.assert_eq(blake2s.rotation(3), 7)
+    test.assert_eq(blake2s.rotation(4), 0)
+    test.assert_eq(blake2s.rotation(-1), 0)
+    test.case("sigma is the table BLAKE2b reads, for ten rounds")
+    for r in 0..10
+        for i in 0..16
+            test.assert_eq(blake2s.sigma(r, i), blake2b.sigma(r, i))
+    test.assert_eq(blake2s.sigma(10, 0), 0)
+    test.assert_eq(blake2s.sigma(-1, 0), 0)
+    test.assert_eq(blake2s.sigma(1, 16), 0)
+    test.assert_eq(blake2s.sigma(1, -1), 0)
+
+@test
+fn test_blake2s_rotr_is_a_32_bit_rotation_with_the_result_masked() [io]
+    test.assert_eq(blake2s.rotr(0x89abcdef, 8), 4018777037)
+    test.assert_eq(blake2s.rotr(0x89abcdef, 31), 324508639)
+    test.assert_eq(blake2s.rotr(0x89abcdef, 0), 0x89abcdef)
+    test.assert_eq(blake2s.rotr(0x89abcdef, 32), 0x89abcdef)
+    test.assert_eq(blake2s.rotr(1, 1), 2147483648)
+    test.case("the high half of the argument is dropped")
+    test.assert_eq(blake2s.rotr(0x1FFFFFFFF, 4), 0xFFFFFFFF)
+    test.assert_eq(blake2s.mask(0x100000001), 1)
+    test.assert_eq(blake2s.mask(-1), 0xFFFFFFFF)
+
+@test
+fn test_a_fresh_blake2s_state_holds_the_parameter_block_xor_the_iv() [io]
+    let z = blake2s.zero_state()
+    for i in 0..8
+        test.assert_eq(blake2s.state_word(z, i), 0)
+    test.assert_eq(blake2s.digest_length(z), 0)
+    let st = blake2s.init(b2param.sequential(32))
+    test.assert_eq(blake2s.state_word(st, 0), blake2s.iv(0) ^ 16842784)
+    for i in 1..8
+        test.assert_eq(blake2s.state_word(st, i), blake2s.iv(i))
+    test.assert_eq(blake2s.digest_length(st), 32)
+    test.assert_eq(blake2s.buffered(st), 0)
+    test.assert_eq(blake2s.counter_low(st), 0)
+    test.assert_eq(blake2s.counter_high(st), 0)
+    test.assert(not blake2s.is_last(st))
+    test.assert(not blake2s.is_last_node(st))
+
+@test
+fn test_blake2s_word_accessors_mask_and_answer_zero_or_unchanged_out_of_range() [io]
+    let st = blake2s.with_state_word(blake2s.zero_state(), 3, 0x1FFFFFFFF)
+    test.assert_eq(blake2s.state_word(st, 3), 0xFFFFFFFF)
+    test.assert_eq(blake2s.state_word(st, 8), 0)
+    test.assert_eq(blake2s.state_word(st, -1), 0)
+    let same = blake2s.with_state_word(st, 8, 5)
+    let same2 = blake2s.with_state_word(st, -1, 5)
+    for i in 0..8
+        test.assert_eq(blake2s.state_word(same, i), blake2s.state_word(st, i))
+        test.assert_eq(blake2s.state_word(same2, i), blake2s.state_word(st, i))
+    let m = blake2s.with_block_word(blake2s.zero_state(), 15, 0x1000000FF)
+    test.assert_eq(blake2s.block_word(m, 15), 0xFF)
+    test.assert_eq(blake2s.block_word(m, 16), 0)
+    test.assert_eq(blake2s.block_word(m, -1), 0)
+    let m2 = blake2s.with_block_word(m, 16, 5)
+    let m3 = blake2s.with_block_word(m, -1, 5)
+    for i in 0..16
+        test.assert_eq(blake2s.block_word(m2, i), blake2s.block_word(m, i))
+        test.assert_eq(blake2s.block_word(m3, i), blake2s.block_word(m, i))
+    let w = blake2s.with_work_word(blake2s.work(st), 5, 0x100000004)
+    test.assert_eq(blake2s.work_word(w, 5), 4)
+    test.assert_eq(blake2s.work_word(w, 16), 0)
+    test.assert_eq(blake2s.work_word(w, -1), 0)
+    let w2 = blake2s.with_work_word(w, 16, 1)
+    let w3 = blake2s.with_work_word(w, -1, 1)
+    for i in 0..16
+        test.assert_eq(blake2s.work_word(w2, i), blake2s.work_word(w, i))
+        test.assert_eq(blake2s.work_word(w3, i), blake2s.work_word(w, i))
+
+@test
+fn test_blake2s_block_bytes_are_little_endian_within_their_word() [io]
+    var st = blake2s.zero_state()
+    st = blake2s.with_block_byte(st, 0, 0x11)
+    st = blake2s.with_block_byte(st, 1, 0x22)
+    st = blake2s.with_block_byte(st, 3, 0x44)
+    st = blake2s.with_block_byte(st, 4, 0x99)
+    st = blake2s.with_block_byte(st, 63, 0xFF)
+    test.assert_eq(blake2s.block_word(st, 0), 0x44002211)
+    test.assert_eq(blake2s.block_word(st, 1), 0x99)
+    test.assert_eq(blake2s.block_word(st, 15), 0xFF000000)
+    test.assert_eq(blake2s.block_byte(st, 0), 0x11)
+    test.assert_eq(blake2s.block_byte(st, 1), 0x22)
+    test.assert_eq(blake2s.block_byte(st, 2), 0)
+    test.assert_eq(blake2s.block_byte(st, 3), 0x44)
+    test.assert_eq(blake2s.block_byte(st, 4), 0x99)
+    test.assert_eq(blake2s.block_byte(st, 63), 0xFF)
+    test.case("overwriting a byte keeps its neighbours, and a byte is taken modulo 256")
+    let over = blake2s.with_block_byte(st, 1, 0x1AB)
+    test.assert_eq(blake2s.block_byte(over, 1), 0xAB)
+    test.assert_eq(blake2s.block_byte(over, 0), 0x11)
+    test.assert_eq(blake2s.block_byte(over, 3), 0x44)
+    test.case("outside 0 ..= 63")
+    test.assert_eq(blake2s.block_byte(st, 64), 0)
+    test.assert_eq(blake2s.block_byte(st, -1), 0)
+    let a = blake2s.with_block_byte(st, 64, 1)
+    let b = blake2s.with_block_byte(st, -1, 1)
+    for i in 0..16
+        test.assert_eq(blake2s.block_word(a, i), blake2s.block_word(st, i))
+        test.assert_eq(blake2s.block_word(b, i), blake2s.block_word(st, i))
+
+@test
+fn test_blake2s_zero_tail_clears_from_buffered_on() [io]
+    var st = blake2s.zero_state()
+    for j in 0..64
+        st = blake2s.with_block_byte(st, j, 0xAA)
+    let cut = blake2s.zero_tail(blake2s.with_buffered(st, 50))
+    test.assert_eq(blake2s.block_byte(cut, 49), 0xAA)
+    test.assert_eq(blake2s.block_byte(cut, 50), 0)
+    test.assert_eq(blake2s.block_byte(cut, 63), 0)
+    test.assert_eq(blake2s.buffered(cut), 50)
+    let full = blake2s.zero_tail(blake2s.with_buffered(st, 64))
+    test.assert_eq(blake2s.block_byte(full, 63), 0xAA)
+    let all = blake2s.zero_tail(blake2s.with_buffered(st, -3))
+    test.assert_eq(blake2s.block_byte(all, 0), 0)
+
+@test
+fn test_the_blake2s_counter_carries_out_of_the_low_half_at_two_to_the_32() [io]
+    let st = blake2s.zero_state()
+    test.assert_eq(blake2s.counter_low(blake2s.add_counter(st, 64)), 64)
+    test.assert_eq(blake2s.counter_high(blake2s.add_counter(st, 64)), 0)
+    let top = blake2s.with_counter(st, 0xFFFFFFFF, 0)
+    let c = blake2s.add_counter(top, 1)
+    test.assert_eq(blake2s.counter_low(c), 0)
+    test.assert_eq(blake2s.counter_high(c), 1)
+    test.case("an addend past 2^32 carries more than one")
+    let d = blake2s.add_counter(st, 0x300000005)
+    test.assert_eq(blake2s.counter_low(d), 5)
+    test.assert_eq(blake2s.counter_high(d), 3)
+    test.case("the high half wraps at 2^32 too")
+    let e = blake2s.add_counter(blake2s.with_counter(st, 0xFFFFFFFF, 0xFFFFFFFF), 1)
+    test.assert_eq(blake2s.counter_low(e), 0)
+    test.assert_eq(blake2s.counter_high(e), 0)
+    let f = blake2s.with_counter(st, 0x1FFFFFFFF, 0x100000002)
+    test.assert_eq(blake2s.counter_low(f), 0xFFFFFFFF)
+    test.assert_eq(blake2s.counter_high(f), 2)
+
+@test
+fn test_the_blake2s_flags_are_0xffffffff_once_set() [io]
+    let st = blake2s.zero_state()
+    test.assert(blake2s.is_last(blake2s.mark_last(st)))
+    test.assert(not blake2s.is_last_node(blake2s.mark_last(st)))
+    test.assert(blake2s.is_last_node(blake2s.mark_last_node(st)))
+    test.assert(not blake2s.is_last(blake2s.mark_last_node(st)))
+    let w = blake2s.work(blake2s.mark_last_node(blake2s.mark_last(blake2s.with_counter(st, 5, 6))))
+    test.assert_eq(blake2s.work_word(w, 12), blake2s.iv(4) ^ 5)
+    test.assert_eq(blake2s.work_word(w, 13), blake2s.iv(5) ^ 6)
+    test.assert_eq(blake2s.work_word(w, 14), blake2s.iv(6) ^ 0xFFFFFFFF)
+    test.assert_eq(blake2s.work_word(w, 15), blake2s.iv(7) ^ 0xFFFFFFFF)
+
+@test
+fn test_blake2s_g_with_an_index_out_of_range_changes_nothing() [io]
+    let w = blake2s.work(blake2s.init(b2param.sequential(32)))
+    for bad in [-1, 16]
+        let a = blake2s.g(w, bad, 4, 8, 12, 1, 2)
+        let b = blake2s.g(w, 0, bad, 8, 12, 1, 2)
+        let c = blake2s.g(w, 0, 4, bad, 12, 1, 2)
+        let d = blake2s.g(w, 0, 4, 8, bad, 1, 2)
+        for i in 0..16
+            test.assert_eq(blake2s.work_word(a, i), blake2s.work_word(w, i))
+            test.assert_eq(blake2s.work_word(b, i), blake2s.work_word(w, i))
+            test.assert_eq(blake2s.work_word(c, i), blake2s.work_word(w, i))
+            test.assert_eq(blake2s.work_word(d, i), blake2s.work_word(w, i))
+    let ok = blake2s.g(w, 0, 4, 8, 12, 1, 2)
+    test.assert(blake2s.work_word(ok, 0) != blake2s.work_word(w, 0))
+
+@test
+fn test_blake2s_feed_byte_and_finish() [io]
+    var st = blake2s.init(b2param.sequential(32))
+    for i in 0..64
+        st = blake2s.feed_byte(st, i)
+    test.assert_eq(blake2s.buffered(st), 64)
+    test.assert_eq(blake2s.counter_low(st), 0)
+    let next = blake2s.feed_byte(st, 0x5A)
+    test.assert_eq(blake2s.buffered(next), 1)
+    test.assert_eq(blake2s.counter_low(next), 64)
+    test.assert_eq(blake2s.block_byte(next, 0), 0x5A)
+    test.assert_eq(blake2s.block_byte(blake2s.feed_byte(blake2s.init(b2param.sequential(32)), 0x1FF), 0), 0xFF)
+    var small = blake2s.init(b2param.sequential(32))
+    for i in 0..5
+        small = blake2s.feed_byte(small, i)
+    let done = blake2s.finish(small)
+    test.assert(blake2s.is_last(done))
+    test.assert_eq(blake2s.counter_low(done), 5)
+    test.assert_eq(blake2s.buffered(done), 0)
+    test.assert_eq(blake2s.digest_byte(done, 32), 0)
+    test.assert_eq(blake2s.digest_byte(done, -1), 0)
+    test.assert_eq(blake2s.digest_byte(blake2s.zero_state(), 0), 0)
+    var wide = blake2s.zero_state()
+    wide = blake2s.with_state_word(wide, 0, 1)
+    test.assert_eq(blake2s.digest_byte(wide, 0), 0)
+    test.assert_eq(blake2s.digest_byte(wide, 32), 0)
+    test.assert(blake2s.digest_byte(done, 0) != 0 or blake2s.digest_byte(done, 1) != 0)
+
+// ── b2bytes ──────────────────────────────────────────────────────────
+
+@test
+fn test_word_le_reads_little_endian_and_zero_fills_past_the_end() [io]
+    let b = hex("0102030405060708090a")
+    test.assert_eq(b2bytes.word_le(b, 0), 0x0807060504030201)
+    test.assert_eq(b2bytes.word_le(b, 2), 0x0a09080706050403)
+    test.assert_eq(b2bytes.word_le(b, 4), 0x0a0908070605)
+    test.assert_eq(b2bytes.word_le(b, 20), 0)
+    test.assert_eq(b2bytes.word_le32(b, 0), 0x04030201)
+    test.assert_eq(b2bytes.word_le32(b, 8), 0x0a09)
+    test.assert_eq(b2bytes.word_le32(b, 40), 0)
+    test.assert_eq(b2bytes.word_le(hex("ffffffffffffffff"), 0), -1)
+
+@test
+fn test_the_digest_length_and_key_checks() [io]
+    test.case("digest length")
+    test.assert_eq_str(text_of(b2bytes.check_digest_length_b(0)), "the digest length is 0, want 1 to 64")
+    test.assert_eq_str(text_of(b2bytes.check_digest_length_b(65)), "the digest length is 65, want 1 to 64")
+    test.assert(not is_some(b2bytes.check_digest_length_b(1)))
+    test.assert(not is_some(b2bytes.check_digest_length_b(64)))
+    test.assert_eq_str(text_of(b2bytes.check_digest_length_s(0)), "the digest length is 0, want 1 to 32")
+    test.assert_eq_str(text_of(b2bytes.check_digest_length_s(33)), "the digest length is 33, want 1 to 32")
+    test.assert(not is_some(b2bytes.check_digest_length_s(1)))
+    test.assert(not is_some(b2bytes.check_digest_length_s(32)))
+    test.case("key")
+    test.assert(not is_some(b2bytes.check_key_b(bytes.zeros(0))))
+    test.assert(not is_some(b2bytes.check_key_b(bytes.zeros(64))))
+    test.assert_eq_str(text_of(b2bytes.check_key_b(bytes.zeros(65))), "the key is 65 bytes, the most is 64")
+    test.assert(not is_some(b2bytes.check_key_s(bytes.zeros(0))))
+    test.assert(not is_some(b2bytes.check_key_s(bytes.zeros(32))))
+    test.assert_eq_str(text_of(b2bytes.check_key_s(bytes.zeros(33))), "the key is 33 bytes, the most is 32")
+
+@test
+fn test_the_salt_and_personalisation_checks_want_exactly_the_width_or_nothing() [io]
+    test.assert(not is_some(b2bytes.check_salt_b(bytes.zeros(0))))
+    test.assert(not is_some(b2bytes.check_salt_b(bytes.zeros(16))))
+    test.assert_eq_str(text_of(b2bytes.check_salt_b(bytes.zeros(8))), "the salt is 8 bytes, want 16 or none")
+    test.assert_eq_str(text_of(b2bytes.check_salt_b(bytes.zeros(17))), "the salt is 17 bytes, want 16 or none")
+    test.assert(not is_some(b2bytes.check_salt_s(bytes.zeros(0))))
+    test.assert(not is_some(b2bytes.check_salt_s(bytes.zeros(8))))
+    test.assert_eq_str(text_of(b2bytes.check_salt_s(bytes.zeros(16))), "the salt is 16 bytes, want 8 or none")
+    test.assert(not is_some(b2bytes.check_personal_b(bytes.zeros(0))))
+    test.assert(not is_some(b2bytes.check_personal_b(bytes.zeros(16))))
+    test.assert_eq_str(text_of(b2bytes.check_personal_b(bytes.zeros(1))),
+        "the personalisation is 1 bytes, want 16 or none")
+    test.assert(not is_some(b2bytes.check_personal_s(bytes.zeros(0))))
+    test.assert(not is_some(b2bytes.check_personal_s(bytes.zeros(8))))
+    test.assert_eq_str(text_of(b2bytes.check_personal_s(bytes.zeros(9))),
+        "the personalisation is 9 bytes, want 8 or none")
+
+@test
+fn test_check_inputs_answers_the_first_problem_in_the_documented_order() [io]
+    let z = bytes.zeros(0)
+    test.case("BLAKE2b")
+    test.assert(not is_some(b2bytes.check_inputs_b(32, z, z, z)))
+    test.assert_eq_str(text_of(b2bytes.check_inputs_b(0, bytes.zeros(99), bytes.zeros(3), bytes.zeros(3))),
+        "the digest length is 0, want 1 to 64")
+    test.assert_eq_str(text_of(b2bytes.check_inputs_b(32, bytes.zeros(99), bytes.zeros(3), bytes.zeros(3))),
+        "the key is 99 bytes, the most is 64")
+    test.assert_eq_str(text_of(b2bytes.check_inputs_b(32, z, bytes.zeros(3), bytes.zeros(3))),
+        "the salt is 3 bytes, want 16 or none")
+    test.assert_eq_str(text_of(b2bytes.check_inputs_b(32, z, z, bytes.zeros(3))),
+        "the personalisation is 3 bytes, want 16 or none")
+    test.case("BLAKE2s")
+    test.assert(not is_some(b2bytes.check_inputs_s(32, z, z, z)))
+    test.assert_eq_str(text_of(b2bytes.check_inputs_s(0, bytes.zeros(99), bytes.zeros(3), bytes.zeros(3))),
+        "the digest length is 0, want 1 to 32")
+    test.assert_eq_str(text_of(b2bytes.check_inputs_s(32, bytes.zeros(99), bytes.zeros(3), bytes.zeros(3))),
+        "the key is 99 bytes, the most is 32")
+    test.assert_eq_str(text_of(b2bytes.check_inputs_s(32, z, bytes.zeros(3), bytes.zeros(3))),
+        "the salt is 3 bytes, want 8 or none")
+    test.assert_eq_str(text_of(b2bytes.check_inputs_s(32, z, z, bytes.zeros(3))),
+        "the personalisation is 3 bytes, want 8 or none")
+
+@test
+fn test_params_from_bytes_read_the_salt_and_personalisation_little_endian() [io]
+    let salt = hex("0102030405060708090a0b0c0d0e0f10")
+    let per = hex("1112131415161718191a1b1c1d1e1f20")
+    let none = bytes.zeros(0)
+    let p = b2bytes.params_b(32, bytes.zeros(7), salt, per)
+    test.assert_eq(b2param.digest_length(p), 32)
+    test.assert_eq(b2param.key_length(p), 7)
+    test.assert_eq(b2param.salt_lo(p), 0x0807060504030201)
+    test.assert_eq(b2param.salt_hi(p), 0x100f0e0d0c0b0a09)
+    test.assert_eq(b2param.personal_lo(p), 0x1817161514131211)
+    test.assert_eq(b2param.personal_hi(p), 0x201f1e1d1c1b1a19)
+    let q = b2bytes.params_b(32, none, none, none)
+    test.assert_eq(b2param.salt_lo(q), 0)
+    test.assert_eq(b2param.personal_lo(q), 0)
+    test.assert(b2param.is_sequential(q))
+    let s = b2bytes.params_s(20, bytes.zeros(3), hex("0102030405060708"), hex("1112131415161718"))
+    test.assert_eq(b2param.digest_length(s), 20)
+    test.assert_eq(b2param.key_length(s), 3)
+    test.assert_eq(b2param.salt_lo(s), 0x0807060504030201)
+    test.assert_eq(b2param.salt_hi(s), 0)
+    test.assert_eq(b2param.personal_lo(s), 0x1817161514131211)
+    test.assert_eq(b2param.personal_hi(s), 0)
+    let t = b2bytes.params_s(20, none, none, none)
+    test.assert_eq(b2param.salt_lo(t), 0)
+    test.assert_eq(b2param.personal_lo(t), 0)
+
+@test
+fn test_init_keyed_absorbs_the_zero_padded_key_as_a_full_block() [io]
+    let key = hex("000102030405060708090a0b0c0d0e0f")
+    let p = b2bytes.params_b(32, key, bytes.zeros(0), bytes.zeros(0))
+    let st = b2bytes.init_keyed_b(p, key)
+    test.assert_eq(blake2b.buffered(st), 128)
+    test.assert_eq(blake2b.counter_low(st), 0)
+    test.assert_eq(blake2b.block_byte(st, 0), 0)
+    test.assert_eq(blake2b.block_byte(st, 15), 15)
+    test.assert_eq(blake2b.block_byte(st, 16), 0)
+    test.assert_eq(blake2b.block_byte(st, 127), 0)
+    test.case("no key declared: the state is what init made")
+    let plain = b2bytes.init_keyed_b(b2param.sequential(32), key)
+    test.assert_eq(blake2b.buffered(plain), 0)
+    test.case("a key shorter than the declared length reads as zeros past its end")
+    let long = b2bytes.init_keyed_b(b2param.keyed(32, 20), key)
+    test.assert_eq(blake2b.block_byte(long, 15), 15)
+    test.assert_eq(blake2b.block_byte(long, 16), 0)
+    let ps = b2bytes.params_s(32, key, bytes.zeros(0), bytes.zeros(0))
+    let ss = b2bytes.init_keyed_s(ps, key)
+    test.assert_eq(blake2s.buffered(ss), 64)
+    test.assert_eq(blake2s.block_byte(ss, 15), 15)
+    test.assert_eq(blake2s.block_byte(ss, 16), 0)
+    let sp = b2bytes.init_keyed_s(b2param.sequential(32), key)
+    test.assert_eq(blake2s.buffered(sp), 0)
+    let sl = b2bytes.init_keyed_s(b2param.keyed(32, 20), key)
+    test.assert_eq(blake2s.block_byte(sl, 15), 15)
+    test.assert_eq(blake2s.block_byte(sl, 16), 0)
+
+@test
+fn test_update_range_cuts_the_range_to_the_buffer() [io]
+    let msg = bytes.from_str("xabcx")
+    let st = blake2b.init(b2param.sequential(32))
+    test.assert_eq(blake2b.buffered(b2bytes.update_range_b(st, msg, 1, 3)), 3)
+    test.assert_eq(blake2b.block_byte(b2bytes.update_range_b(st, msg, 1, 3), 0), 0x61)
+    test.case("a start before the buffer begins at zero")
+    test.assert_eq(blake2b.buffered(b2bytes.update_range_b(st, msg, -2, 4)), 2)
+    test.case("a count past the end stops at the end")
+    test.assert_eq(blake2b.buffered(b2bytes.update_range_b(st, msg, 3, 99)), 2)
+    test.case("an empty or inverted range feeds nothing")
+    test.assert_eq(blake2b.buffered(b2bytes.update_range_b(st, msg, 2, 0)), 0)
+    test.assert_eq(blake2b.buffered(b2bytes.update_range_b(st, msg, 2, -5)), 0)
+    test.assert_eq(blake2b.buffered(b2bytes.update_range_b(st, msg, 9, 1)), 0)
+    let ss = blake2s.init(b2param.sequential(32))
+    test.assert_eq(blake2s.buffered(b2bytes.update_range_s(ss, msg, 1, 3)), 3)
+    test.assert_eq(blake2s.buffered(b2bytes.update_range_s(ss, msg, -2, 4)), 2)
+    test.assert_eq(blake2s.buffered(b2bytes.update_range_s(ss, msg, 3, 99)), 2)
+    test.assert_eq(blake2s.buffered(b2bytes.update_range_s(ss, msg, 2, 0)), 0)
+    test.assert_eq(blake2s.buffered(b2bytes.update_range_s(ss, msg, 9, 1)), 0)
+    test.assert_eq(blake2s.buffered(b2bytes.update_s(ss, msg)), 5)
+    test.assert_eq(blake2b.buffered(b2bytes.update_b(st, msg)), 5)
+
+@test
+fn test_finish_into_refuses_a_short_buffer_and_names_the_prefix_of_a_long_one() [io]
+    let st = blake2b.init(b2param.sequential(32))
+    match b2bytes.finish_into_b(st, bytes.zeros(31))
+        Ok(_)  => test.fail("a 31-byte buffer holds a 32-byte digest")
+        Err(e) => test.assert_eq_str(e.message(), "the output buffer has 31 bytes, want 32")
+    let out = hex("aabbccddeeff")
+    let st1 = blake2b.init(b2param.sequential(4))
+    match b2bytes.finish_into_b(st1, out)
+        Ok(d)  => test.assert_eq(bytes.len(d), 4)
+        Err(e) => test.fail(e.message())
+    test.case("the caller's buffer is not modified")
+    test.assert_eq_str(bytes.to_hex(out), "aabbccddeeff")
+    match b2bytes.finish_into_b(st1, bytes.zeros(40))
+        Ok(d)  => test.assert_eq_str(bytes.to_hex(d), "1271cf25")
+        Err(e) => test.fail(e.message())
+    let ss = blake2s.init(b2param.sequential(32))
+    match b2bytes.finish_into_s(ss, bytes.zeros(31))
+        Ok(_)  => test.fail("a 31-byte buffer holds a 32-byte digest")
+        Err(e) => test.assert_eq_str(e.message(), "the output buffer has 31 bytes, want 32")
+    match b2bytes.finish_into_s(blake2s.init(b2param.sequential(4)), bytes.zeros(9))
+        Ok(d)  => test.assert_eq(bytes.len(d), 4)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_one_shots_refuse_a_digest_length_outside_the_range() [io]
+    match b2bytes.blake2b_into(bytes.zeros(1), bytes.zeros(0))
+        Ok(_)  => test.fail("a zero-length digest is not a digest")
+        Err(e) => test.assert_eq_str(e.message(), "the digest length is 0, want 1 to 64")
+    match b2bytes.blake2b_into(bytes.zeros(1), bytes.zeros(65))
+        Ok(_)  => test.fail("65 bytes is more than BLAKE2b makes")
+        Err(e) => test.assert_eq_str(e.message(), "the digest length is 65, want 1 to 64")
+    match b2bytes.blake2s_into(bytes.zeros(1), bytes.zeros(0))
+        Ok(_)  => test.fail("a zero-length digest is not a digest")
+        Err(e) => test.assert_eq_str(e.message(), "the digest length is 0, want 1 to 32")
+    match b2bytes.blake2s_into(bytes.zeros(1), bytes.zeros(33))
+        Ok(_)  => test.fail("33 bytes is more than BLAKE2s makes")
+        Err(e) => test.assert_eq_str(e.message(), "the digest length is 33, want 1 to 32")
+    test.case("keyed")
+    match b2bytes.blake2b_keyed_into(bytes.zeros(65), bytes.zeros(1), bytes.zeros(32))
+        Ok(_)  => test.fail("a 65-byte key")
+        Err(e) => test.assert_eq_str(e.message(), "the key is 65 bytes, the most is 64")
+    match b2bytes.blake2b_keyed_into(bytes.zeros(2), bytes.zeros(1), bytes.zeros(0))
+        Ok(_)  => test.fail("no digest")
+        Err(e) => test.assert_eq_str(e.message(), "the digest length is 0, want 1 to 64")
+    match b2bytes.blake2s_keyed_into(bytes.zeros(33), bytes.zeros(1), bytes.zeros(32))
+        Ok(_)  => test.fail("a 33-byte key")
+        Err(e) => test.assert_eq_str(e.message(), "the key is 33 bytes, the most is 32")
+    match b2bytes.blake2s_keyed_into(bytes.zeros(2), bytes.zeros(1), bytes.zeros(0))
+        Ok(_)  => test.fail("no digest")
+        Err(e) => test.assert_eq_str(e.message(), "the digest length is 0, want 1 to 32")
+
+@test
+fn test_the_full_one_shot_refuses_each_thing_it_cannot_drive() [io]
+    let z = bytes.zeros(0)
+    let p = b2param.sequential(32)
+    test.case("a digest length the block cannot carry")
+    match b2bytes.blake2b_full_into(b2param.sequential(65), z, z, bytes.zeros(65))
+        Ok(_)  => test.fail("digest 65")
+        Err(e) => test.assert_eq_str(e.message(), "the digest length is 65, want 1 to 64")
+    match b2bytes.blake2s_full_into(b2param.sequential(33), z, z, bytes.zeros(33))
+        Ok(_)  => test.fail("digest 33")
+        Err(e) => test.assert_eq_str(e.message(), "the digest length is 33, want 1 to 32")
+    test.case("a key longer than the algorithm admits")
+    match b2bytes.blake2b_full_into(p, bytes.zeros(65), z, bytes.zeros(32))
+        Ok(_)  => test.fail("key 65")
+        Err(e) => test.assert_eq_str(e.message(), "the key is 65 bytes, the most is 64")
+    match b2bytes.blake2s_full_into(p, bytes.zeros(33), z, bytes.zeros(32))
+        Ok(_)  => test.fail("key 33")
+        Err(e) => test.assert_eq_str(e.message(), "the key is 33 bytes, the most is 32")
+    test.case("a tree block")
+    let tree = b2param.with_tree(p, 4, 2, 4096, 0, 0, 32)
+    match b2bytes.blake2b_full_into(tree, z, z, bytes.zeros(32))
+        Ok(_)  => test.fail("tree")
+        Err(e) => test.assert_eq_str(e.message(), "tree mode (fanout 4, depth 2) is not driven by the one-shots")
+    match b2bytes.blake2s_full_into(tree, z, z, bytes.zeros(32))
+        Ok(_)  => test.fail("tree")
+        Err(e) => test.assert_eq_str(e.message(), "tree mode (fanout 4, depth 2) is not driven by the one-shots")
+    test.case("a buffer the block disagrees with")
+    match b2bytes.blake2b_full_into(p, z, z, bytes.zeros(31))
+        Ok(_)  => test.fail("small")
+        Err(e) => test.assert_eq_str(e.message(), "the output buffer has 31 bytes, want 32")
+    match b2bytes.blake2b_full_into(p, z, z, bytes.zeros(33))
+        Ok(_)  => test.fail("large")
+        Err(e) => test.assert_eq_str(e.message(), "the digest length is 33, want 1 to 32")
+    match b2bytes.blake2s_full_into(p, z, z, bytes.zeros(31))
+        Ok(_)  => test.fail("small")
+        Err(e) => test.assert_eq_str(e.message(), "the output buffer has 31 bytes, want 32")
+    match b2bytes.blake2s_full_into(p, z, z, bytes.zeros(33))
+        Ok(_)  => test.fail("large")
+        Err(e) => test.assert_eq_str(e.message(), "the digest length is 33, want 1 to 32")
+
+@test
+fn test_the_full_one_shot_takes_the_key_length_from_the_key() [io]
+    let key = hex("000102030405060708090a0b0c0d0e0f")
+    let z = bytes.zeros(0)
+    match b2bytes.blake2b_full_into(b2param.sequential(32), key, bytes.from_str("abc"), bytes.zeros(32))
+        Ok(a)  =>
+            match b2bytes.blake2b_keyed_into(key, bytes.from_str("abc"), bytes.zeros(32))
+                Ok(b)  => test.assert_eq_str(bytes.to_hex(a), bytes.to_hex(b))
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    match b2bytes.blake2s_full_into(b2param.sequential(32), key, bytes.from_str("abc"), bytes.zeros(32))
+        Ok(a)  =>
+            match b2bytes.blake2s_keyed_into(key, bytes.from_str("abc"), bytes.zeros(32))
+                Ok(b)  => test.assert_eq_str(bytes.to_hex(a), bytes.to_hex(b))
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())

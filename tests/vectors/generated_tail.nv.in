@@ -1,0 +1,205 @@
+// ── Tests over the rows ──────────────────────────────────────────────
+
+fn fail_with(e: B2Error)
+    test.fail(e.message())
+
+@test
+fn test_blake2b_matches_hashlib_on_every_row() [io]
+    var i = 0
+    for r in rows_b()
+        test.case("row ${i}: ${bytes.len(hex(r[4]))} bytes over ${bytes.len(hex(r[0]))}")
+        let msg = hex(r[0])
+        let key = hex(r[1])
+        let n = bytes.len(hex(r[4]))
+        let p = b2bytes.params_b(n, key, hex(r[2]), hex(r[3]))
+        match b2bytes.blake2b_full_into(p, key, msg, bytes.zeros(n))
+            Ok(d) => test.assert_eq_str(bytes.to_hex(d), r[4])
+            Err(e) => fail_with(e)
+        if bytes.len(hex(r[2])) == 0 and bytes.len(hex(r[3])) == 0
+            match b2bytes.blake2b_keyed_into(key, msg, bytes.zeros(n))
+                Ok(d) => test.assert_eq_str(bytes.to_hex(d), r[4])
+                Err(e) => fail_with(e)
+        i = i + 1
+
+@test
+fn test_blake2s_matches_hashlib_on_every_row() [io]
+    var i = 0
+    for r in rows_s()
+        test.case("row ${i}: ${bytes.len(hex(r[4]))} bytes over ${bytes.len(hex(r[0]))}")
+        let msg = hex(r[0])
+        let key = hex(r[1])
+        let n = bytes.len(hex(r[4]))
+        let p = b2bytes.params_s(n, key, hex(r[2]), hex(r[3]))
+        match b2bytes.blake2s_full_into(p, key, msg, bytes.zeros(n))
+            Ok(d) => test.assert_eq_str(bytes.to_hex(d), r[4])
+            Err(e) => fail_with(e)
+        if bytes.len(hex(r[2])) == 0 and bytes.len(hex(r[3])) == 0
+            match b2bytes.blake2s_keyed_into(key, msg, bytes.zeros(n))
+                Ok(d) => test.assert_eq_str(bytes.to_hex(d), r[4])
+                Err(e) => fail_with(e)
+        i = i + 1
+
+// The unkeyed, unsalted rows through the plain one-shot, and the same rows
+// fed to the word-level state one byte at a time, which is the device path.
+@test
+fn test_the_plain_one_shot_and_the_byte_at_a_time_state_agree_with_hashlib() [io]
+    for r in rows_b()
+        if bytes.len(hex(r[1])) == 0 and bytes.len(hex(r[2])) == 0 and bytes.len(hex(r[3])) == 0
+            let msg = hex(r[0])
+            let n = bytes.len(hex(r[4]))
+            match b2bytes.blake2b_into(msg, bytes.zeros(n))
+                Ok(d) => test.assert_eq_str(bytes.to_hex(d), r[4])
+                Err(e) => fail_with(e)
+            var st = blake2b.init(b2param.sequential(n))
+            for k in 0..bytes.len(msg)
+                st = blake2b.feed_byte(st, bytes.byte_at(msg, k) ?? 0)
+            st = blake2b.finish(st)
+            var got = ""
+            for k in 0..n
+                got = got + bytes.to_hex(bytes.u8(blake2b.digest_byte(st, k)))
+            test.assert_eq_str(got, r[4])
+    for r in rows_s()
+        if bytes.len(hex(r[1])) == 0 and bytes.len(hex(r[2])) == 0 and bytes.len(hex(r[3])) == 0
+            let msg = hex(r[0])
+            let n = bytes.len(hex(r[4]))
+            match b2bytes.blake2s_into(msg, bytes.zeros(n))
+                Ok(d) => test.assert_eq_str(bytes.to_hex(d), r[4])
+                Err(e) => fail_with(e)
+            var st = blake2s.init(b2param.sequential(n))
+            for k in 0..bytes.len(msg)
+                st = blake2s.feed_byte(st, bytes.byte_at(msg, k) ?? 0)
+            st = blake2s.finish(st)
+            var got = ""
+            for k in 0..n
+                got = got + bytes.to_hex(bytes.u8(blake2s.digest_byte(st, k)))
+            test.assert_eq_str(got, r[4])
+
+// Chunking is invisible: every keyed or unkeyed row hashed in chunks of 1, 7,
+// 64 and 129 bytes gives the digest of the whole.
+@test
+fn test_chunked_updates_give_the_digest_of_the_whole() [io]
+    for r in rows_b()
+        if bytes.len(hex(r[2])) == 0 and bytes.len(hex(r[3])) == 0
+            let msg = hex(r[0])
+            let key = hex(r[1])
+            let n = bytes.len(hex(r[4]))
+            let p = b2bytes.params_b(n, key, bytes.zeros(0), bytes.zeros(0))
+            for step in [1, 7, 64, 129]
+                var st = b2bytes.init_keyed_b(p, key)
+                var off = 0
+                while off < bytes.len(msg)
+                    st = b2bytes.update_range_b(st, msg, off, step)
+                    off = off + step
+                match b2bytes.finish_into_b(st, bytes.zeros(n))
+                    Ok(d) => test.assert_eq_str(bytes.to_hex(d), r[4])
+                    Err(e) => fail_with(e)
+    for r in rows_s()
+        if bytes.len(hex(r[2])) == 0 and bytes.len(hex(r[3])) == 0
+            let msg = hex(r[0])
+            let key = hex(r[1])
+            let n = bytes.len(hex(r[4]))
+            let p = b2bytes.params_s(n, key, bytes.zeros(0), bytes.zeros(0))
+            for step in [1, 7, 64, 129]
+                var st = b2bytes.init_keyed_s(p, key)
+                var off = 0
+                while off < bytes.len(msg)
+                    st = b2bytes.update_range_s(st, msg, off, step)
+                    off = off + step
+                match b2bytes.finish_into_s(st, bytes.zeros(n))
+                    Ok(d) => test.assert_eq_str(bytes.to_hex(d), r[4])
+                    Err(e) => fail_with(e)
+
+fn state_b(r: [Int]) -> B2bState
+    var st = blake2b.zero_state()
+    for i in 0..8
+        st = blake2b.with_state_word(st, i, r[i])
+    for i in 0..16
+        st = blake2b.with_block_word(st, i, r[8 + i])
+    st = blake2b.with_counter(st, r[24], r[25])
+    if r[26] == 1
+        st = blake2b.mark_last(st)
+    if r[27] == 1
+        st = blake2b.mark_last_node(st)
+    st
+
+fn state_s(r: [Int]) -> B2sState
+    var st = blake2s.zero_state()
+    for i in 0..8
+        st = blake2s.with_state_word(st, i, r[i])
+    for i in 0..16
+        st = blake2s.with_block_word(st, i, r[8 + i])
+    st = blake2s.with_counter(st, r[24], r[25])
+    if r[26] == 1
+        st = blake2s.mark_last(st)
+    if r[27] == 1
+        st = blake2s.mark_last_node(st)
+    st
+
+@test
+fn test_blake2b_work_vector_round_and_compression_match_the_reference() [io]
+    var n = 0
+    for r in inter_b()
+        test.case("block ${n}")
+        let st = state_b(r)
+        let w = blake2b.work(st)
+        for i in 0..16
+            test.assert_eq(blake2b.work_word(w, i), r[28 + i])
+        let x = blake2b.round(w, st, r[44])
+        for i in 0..16
+            test.assert_eq(blake2b.work_word(x, i), r[45 + i])
+        let c = blake2b.compress(st)
+        for i in 0..8
+            test.assert_eq(blake2b.state_word(c, i), r[61 + i])
+        test.assert_eq(blake2b.buffered(c), 0)
+        n = n + 1
+
+@test
+fn test_blake2s_work_vector_round_and_compression_match_the_reference() [io]
+    var n = 0
+    for r in inter_s()
+        test.case("block ${n}")
+        let st = state_s(r)
+        let w = blake2s.work(st)
+        for i in 0..16
+            test.assert_eq(blake2s.work_word(w, i), r[28 + i])
+        let x = blake2s.round(w, st, r[44])
+        for i in 0..16
+            test.assert_eq(blake2s.work_word(x, i), r[45 + i])
+        let c = blake2s.compress(st)
+        for i in 0..8
+            test.assert_eq(blake2s.state_word(c, i), r[61 + i])
+        test.assert_eq(blake2s.buffered(c), 0)
+        n = n + 1
+
+@test
+fn test_g_matches_the_reference_on_both_widths() [io]
+    for r in g_b()
+        var w = blake2b.work(blake2b.zero_state())
+        for i in 0..16
+            w = blake2b.with_work_word(w, i, r[i])
+        let o = blake2b.g(w, r[16], r[17], r[18], r[19], r[20], r[21])
+        for i in 0..16
+            test.assert_eq(blake2b.work_word(o, i), r[22 + i])
+    for r in g_s()
+        var w = blake2s.work(blake2s.zero_state())
+        for i in 0..16
+            w = blake2s.with_work_word(w, i, r[i])
+        let o = blake2s.g(w, r[16], r[17], r[18], r[19], r[20], r[21])
+        for i in 0..16
+            test.assert_eq(blake2s.work_word(o, i), r[22 + i])
+
+fn params_of(r: [Int]) -> B2Params
+    B2Params { digest_length: r[0], key_length: r[1], fanout: r[2], depth: r[3],
+               leaf_length: r[4], node_offset: r[5], node_depth: r[6], inner_length: r[7],
+               salt_lo: r[8], salt_hi: r[9], personal_lo: r[10], personal_hi: r[11] }
+
+@test
+fn test_the_parameter_block_words_match_the_byte_layout_of_rfc_7693() [io]
+    for r in param_b()
+        let p = params_of(r)
+        for i in 0..8
+            test.assert_eq(b2param.b_word(p, i), r[12 + i])
+    for r in param_s()
+        let p = params_of(r)
+        for i in 0..8
+            test.assert_eq(b2param.s_word(p, i), r[12 + i])

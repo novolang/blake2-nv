@@ -1,0 +1,98 @@
+// embedded_probe.nv — this package's device claim, as a program that
+// either builds for a Cortex-M or does not.
+//
+// It is not a test.  `scripts/shard_audit.sh`'s `core-embedded` row
+// copies it and the modules it names into a package of its own and
+// runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a real Cortex-M4 ELF or fails.
+//
+// What the claim covers: `blake2b` and `blake2s`, which are two whole
+// hashes, and the `b2param` functions they call.  The devices this is
+// for are a bootloader that checks an image in flash before it jumps
+// to it, and a wallet that derives a key; both read a byte, feed it and
+// compare a few bytes at the end, with no heap behind them.  A hash in
+// flight is a `@value` struct of 240 bytes of the caller's own frame.
+//
+// What is not claimed.  `b2bytes` speaks `Bytes`, and `b2err` and the
+// two `check_*` functions of `b2param` carry an enum that holds
+// numbers; they are the host's half and the README says so.
+//
+// What the build checks.  Every function reached from `score` is
+// admitted at `@tier(embedded)`: the build fails if any of them
+// allocates or calls into the host.  The comparisons make the run
+// depend on the arithmetic as well, so a pass means the digest came out
+// right on the device and not only that the calls linked.
+
+use b2param
+use blake2b
+use blake2s
+
+// BLAKE2b-512 of "abc" begins ba80a53f981c4d0d (RFC 7693 appendix A);
+// BLAKE2s-256 of "abc" begins 508c5e8c327c14e2 (appendix B).
+@tier(embedded)
+fn hash_b() -> Int
+    var st = blake2b.init(b2param.sequential(64))
+    st = blake2b.feed_byte(st, 0x61)
+    st = blake2b.feed_byte(st, 0x62)
+    st = blake2b.feed_byte(st, 0x63)
+    let done = blake2b.finish(st)
+    var n = 0
+    if blake2b.digest_byte(done, 0) == 0xba
+        n = n + 1
+    if blake2b.digest_byte(done, 1) == 0x80
+        n = n + 1
+    if blake2b.digest_byte(done, 7) == 0x0d
+        n = n + 1
+    n
+
+@tier(embedded)
+fn hash_s() -> Int
+    var st = blake2s.init(b2param.sequential(32))
+    st = blake2s.feed_byte(st, 0x61)
+    st = blake2s.feed_byte(st, 0x62)
+    st = blake2s.feed_byte(st, 0x63)
+    let done = blake2s.finish(st)
+    var n = 0
+    if blake2s.digest_byte(done, 0) == 0x50
+        n = n + 1
+    if blake2s.digest_byte(done, 1) == 0x8c
+        n = n + 1
+    if blake2s.digest_byte(done, 7) == 0xe2
+        n = n + 1
+    n
+
+// A keyed hash with a salt and a personalisation, which is a parameter
+// block set from constants in flash; the key block is filled by words.
+@tier(embedded)
+fn keyed() -> Int
+    let p = b2param.with_personal(b2param.with_salt(b2param.keyed(32, 8), 1, 2), 3, 4)
+    var st = blake2b.init(p)
+    st = blake2b.with_block_word(st, 0, 0x0706050403020100)
+    st = blake2b.with_buffered(st, blake2b.B2B_BLOCK_BYTES)
+    st = blake2b.feed_byte(st, 0x61)
+    let done = blake2b.finish(st)
+    if blake2b.digest_length(done) == 32 and blake2b.is_last(done)
+        1
+    else
+        0
+
+@tier(embedded)
+fn score() -> Int
+    hash_b() + hash_s() + keyed()
+
+@tier(rt)
+fn main() [hw, time]
+    bsp.board.init()
+    // 7 is the number of checks in `score`.  The count is printed on a
+    // failure rather than only compared, so a device that disagrees
+    // with the host says how many it lost.
+    let n = score()
+    if n == 7
+        hal.uart.write("PASS: blake2-embedded\n")
+    else
+        hal.uart.write("FAIL: blake2-embedded\n")
+    loop
+        core.rt.sleep_ms(1000)

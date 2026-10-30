@@ -1,0 +1,29 @@
+[package]
+name        = "blake2-nv"
+version     = "0.1.0"
+description = "RFC 7693's BLAKE2b and BLAKE2s, plain and keyed, with the salt, the personalisation and the digest length as a parameter block.  The compression function, the buffered update and the finish are word algebra on @value structs that a device holds in its own frame; the Bytes half writes a digest into a caller's buffer.  Keyed BLAKE2 is the MAC, so there is no HMAC here."
+license     = "Apache-2.0"
+stability   = "experimental"
+
+# BLAKE2 is addition, XOR and rotation over sixteen words.  There is no
+# entropy source, no clock and no file access: the key, the salt and the
+# personalisation all arrive as arguments.
+layer       = "core"
+
+# The modules that take `Bytes` or carry the error enum, which are heap
+# objects.  `b2param`, `blake2b` and `blake2s` are the modules the device
+# build covers, and `tests/embedded_probe.nv` builds them for a Cortex-M4.
+host_modules = ["b2bytes", "b2err"]
+
+category    = "crypto"
+
+tags        = ["blake2", "blake2b", "blake2s", "rfc-7693", "hash", "mac", "keyed-hash", "crypto", "embedded"]
+repository  = "https://github.com/novolang/blake2-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.22.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "BLAKE2b and BLAKE2s, plain and keyed"
